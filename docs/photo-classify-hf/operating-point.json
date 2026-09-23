@@ -1,0 +1,60 @@
+{
+  "freeze": "2026-08-31",
+  "task": "photo_ai_versus_camera",
+  "not": ["synthid_decoder", "provenance", "universal_ai_detector"],
+  "seeds": {
+    "sample": 20260821,
+    "detector": 20260940,
+    "provider": 20260956
+  },
+  "model1": {
+    "backbone": "openai/clip-vit-large-patch14",
+    "letterbox": 224,
+    "pad_rgb": [123, 117, 104],
+    "ridge_threshold_key": "thr_oi_1pct",
+    "ridge_threshold": 0.3056212276800537,
+    "mlp_threshold": 5.9586493237495395,
+    "mlp_width": 512,
+    "definitely": "ridge_and_mlp",
+    "public_ai_label": "definitely_only"
+  },
+  "model2": {
+    "feature_width": 124,
+    "margin": 0.3,
+    "classes": ["openai", "google", "bytedance", "tc260", "muse-image", "no_ai"],
+    "class_kind": {
+      "openai": "provider",
+      "google": "provider",
+      "bytedance": "provider",
+      "tc260": "abstain-veto",
+      "muse-image": "model",
+      "no_ai": "negative"
+    },
+    "public_values": ["openai", "google", "bytedance", "muse-image", null],
+    "bytedance_note": "Doubao and Jimeng render with one ByteDance model family; the class names that shared generator lineage. Measured 2026-09-07 on the frozen test cell: 83.9% (271/323), extended with the historical harvest 83.6% (529/633).",
+    "tc260_note": "the head covers the REST of China's generator ecosystem -- producers (Qwen, Yuanbao, Kling, ...) that are peers of openai/google/meta, not one vendor. No mixed head can honestly name the group, so its argmax win abstains (provider=None). Measured 2026-09-07: without the veto 207/379 China test rows would be falsely named openai/google/muse-image. Per-producer classes return when their train mass holds their own cells (qwen measured at 64 train rows: 27% -- stays in the fallback).",
+    "checkpoint_keys": {
+      "muse-image": "meta_muse_image"
+    },
+    "snapshot_tolerance": "provider.pt snapshots predating bytedance load with five heads; absent heads are skipped and their rows fall to the tc260 veto",
+    "runs_only_after": "definitely"
+  },
+  "receipt_gate": {
+    "added": "2026-09-02",
+    "asset": "receipt-gate-2026-09-02.npz",
+    "threshold": 2.0432573877459697,
+    "runs_only_after": "definitely",
+    "on_hit": "unknown",
+    "head": "linear on the CLIP-L-ft 768-d vector Model 1 already computes",
+    "train": "CORD-v2 train 800 (CC BY 4.0) + 200 synthetic receipts + 2400 ai_train negatives",
+    "certified": "min of 1st-percentile scores on CORD validation and a synthetic holdout; no field-receipt pixels in training or threshold selection",
+    "measured": "field receipts false-AI 19/59 -> 2/59; CORD 89/99 -> 0/99; ai_test DEFINITELY cost 7/1847"
+  },
+  "files": [
+    "clip-l-ft.pt",
+    "clip-l-ft-vision-fp32.onnx",
+    "probe-weights-clip-l-ft.npz",
+    "detector.pt",
+    "provider.pt"
+  ]
+}
