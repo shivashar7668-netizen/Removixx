@@ -1844,13 +1844,14 @@ PAGE = r"""<!doctype html>
     justify-content: center;
     align-items: center;
     width: 100%;
+    padding: 0;
+    margin: 0;
   }
 
   /* ---------- Interactive Split Curtain Comparison Slider ---------- */
   .split-slider-container {
     position: relative;
     width: 100%;
-    max-width: 580px;
     margin: 0 auto;
     border-radius: 18px;
     overflow: hidden;
@@ -1858,16 +1859,20 @@ PAGE = r"""<!doctype html>
     user-select: none;
     -webkit-user-select: none;
     touch-action: pan-y;
-    background: #0f172a;
-    aspect-ratio: 16 / 9;
+    background: transparent;
   }
   #homepage-split-slider {
+    width: 100%;
+    max-width: 100%;
     aspect-ratio: 4 / 5;
-    max-width: 440px;
+    padding: 0;
+    margin: 0;
   }
   #user-split-slider {
     width: 100%;
     max-width: 620px;
+    padding: 0;
+    margin: 0 auto;
   }
   .split-layer {
     position: absolute;
@@ -1876,12 +1881,13 @@ PAGE = r"""<!doctype html>
     width: 100%;
     height: 100%;
     overflow: hidden;
+    padding: 0;
+    margin: 0;
   }
   .split-img {
     width: 100%;
     height: 100%;
-    object-fit: contain;
-    background: #0f172a;
+    object-fit: cover;
     display: block;
     pointer-events: none;
   }
