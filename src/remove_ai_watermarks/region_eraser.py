@@ -277,7 +277,8 @@ def erase_lama(image_bgr: NDArray[Any], mask: NDArray[Any]) -> NDArray[Any]:
     size = next((d for d in reversed(dims) if isinstance(d, int) and d > 1), 512)
 
     h, w = image_bgr.shape[:2]
-    box = _padded_crop_box(mask, h, w, pad_frac=0.4, pad_min=16)
+    # Ample context padding (1.2x mark size, min 96px) so LaMa perceives full surrounding background structure & texture
+    box = _padded_crop_box(mask, h, w, pad_frac=1.2, pad_min=96)
     if box is None:
         return image_bgr.copy()
     cx0, cy0, cx1, cy1 = box
@@ -285,10 +286,18 @@ def erase_lama(image_bgr: NDArray[Any], mask: NDArray[Any]) -> NDArray[Any]:
     crop_mask = mask[cy0:cy1, cx0:cx1]
     ch, cw = crop.shape[:2]
 
-    # Resize crop + mask to the model size, normalize to [0,1] RGB CHW.
+    # Preserve exact 1:1 aspect ratio by padding crop to square before feeding 512x512 to avoid texture stretching
     scale = _full_scale(image_bgr)
-    crop_rs = cv2.resize(crop, (size, size), interpolation=cv2.INTER_AREA)
-    mask_rs = cv2.resize(crop_mask, (size, size), interpolation=cv2.INTER_NEAREST)
+    max_dim = max(ch, cw)
+    square_crop = np.zeros((max_dim, max_dim, 3), dtype=crop.dtype)
+    square_mask = np.zeros((max_dim, max_dim), dtype=np.uint8)
+    off_x = (max_dim - cw) // 2
+    off_y = (max_dim - ch) // 2
+    square_crop[off_y:off_y+ch, off_x:off_x+cw] = crop
+    square_mask[off_y:off_y+ch, off_x:off_x+cw] = crop_mask
+
+    crop_rs = cv2.resize(square_crop, (size, size), interpolation=cv2.INTER_AREA)
+    mask_rs = cv2.resize(square_mask, (size, size), interpolation=cv2.INTER_NEAREST)
     img_in = cv2.cvtColor(crop_rs, cv2.COLOR_BGR2RGB).astype(np.float32) / scale
     img_in = np.transpose(img_in, (2, 0, 1))[None]  # (1,3,size,size)
     mask_in = (mask_rs > 127).astype(np.float32)[None, None]  # (1,1,size,size), 1=hole
@@ -301,15 +310,30 @@ def erase_lama(image_bgr: NDArray[Any], mask: NDArray[Any]) -> NDArray[Any]:
     elif scale != 255.0:  # model emitted 8-bit levels; lift them to the source's scale
         out = out * (scale / 255.0)
     out = np.clip(out, 0, scale).astype(image_bgr.dtype)
-    out_bgr = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+    out_bgr_square = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
 
-    # Resize back to crop size and paste only the masked pixels.
-    out_crop = cv2.resize(out_bgr, (cw, ch), interpolation=cv2.INTER_LINEAR)
+    # Resize square back to max_dim and unpad back to original crop bounds
+    out_full = cv2.resize(out_bgr_square, (max_dim, max_dim), interpolation=cv2.INTER_CUBIC)
+    out_crop = out_full[off_y:off_y+ch, off_x:off_x+cw]
+
+    # Color & Luminance Calibration (eliminates dark / discolored smudges)
+    border_mask = cv2.dilate((crop_mask > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))) - (crop_mask > 127).astype(np.uint8)
+    if np.any(border_mask > 0):
+        for c in range(3):
+            orig_vals = crop[..., c][border_mask > 0]
+            out_vals = out_crop[..., c][border_mask > 0]
+            if orig_vals.size > 20:
+                diff = float(orig_vals.mean()) - float(out_vals.mean())
+                out_crop[..., c] = np.clip(out_crop[..., c].astype(np.float32) + diff * 0.85, 0, scale).astype(image_bgr.dtype)
+
+    # Soft feathered Gaussian blending (eliminates hard rectangular seams)
+    hole = (crop_mask > 127).astype(np.float32)
+    feathered = cv2.GaussianBlur(hole, (7, 7), 2.0)[..., None]
+
     result = image_bgr.copy()
     region = result[cy0:cy1, cx0:cx1]
-    paste = crop_mask > 127
-    region[paste] = out_crop[paste]
-    result[cy0:cy1, cx0:cx1] = region
+    blended = region.astype(np.float32) * (1.0 - feathered) + out_crop.astype(np.float32) * feathered
+    result[cy0:cy1, cx0:cx1] = np.clip(blended, 0, scale).astype(image_bgr.dtype)
     return result
 
 

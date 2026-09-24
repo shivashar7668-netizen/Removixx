@@ -1171,46 +1171,19 @@ def reclean(job_id):
         import numpy as np
         from remove_ai_watermarks import region_eraser
 
-        target_img = cv2.imread(str(out_path))
+        target_img = cv2.imread(str(job_dir / f"input{ext}"))
         if target_img is None:
-            target_img = cv2.imread(str(job_dir / f"input{ext}"))
+            target_img = cv2.imread(str(out_path))
 
         if target_img is None:
             return jsonify({"error": "Could not read image file"}), 500
 
         bx, by, bw, bh = box
-        cleaned = None
-        crop = target_img[by:by+bh, bx:bx+bw]
-        h_c, w_c = crop.shape[:2]
-        if h_c >= 8 and w_c >= 8:
-            gray_c = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-            k_size = max(3, min(15, min(w_c, h_c) // 4))
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_size, k_size))
-            contrast_c = cv2.max(cv2.morphologyEx(gray_c, cv2.MORPH_TOPHAT, kernel),
-                                 cv2.morphologyEx(gray_c, cv2.MORPH_BLACKHAT, kernel))
-            grad_x = cv2.Sobel(gray_c, cv2.CV_32F, 1, 0, ksize=3)
-            grad_y = cv2.Sobel(gray_c, cv2.CV_32F, 0, 1, ksize=3)
-            mag_c = cv2.magnitude(grad_x, grad_y)
-            mag_c = np.uint8(np.clip(mag_c / (mag_c.max() + 1e-5) * 255.0, 0, 255))
-            comb_c = cv2.max(contrast_c, mag_c)
-            _, thresh_c = cv2.threshold(comb_c, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            mask_ratio = cv2.countNonZero(thresh_c) / float(max(1, w_c * h_c))
-            if 0.05 <= mask_ratio <= 0.85:
-                dilate_k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-                dilated_c = cv2.dilate(thresh_c, dilate_k, iterations=1)
-                full_mask = np.zeros(target_img.shape[:2], dtype=np.uint8)
-                full_mask[by:by+bh, bx:bx+bw] = dilated_c
-                try:
-                    cleaned = region_eraser.erase(target_img, mask=full_mask, backend="lama")
-                except Exception:
-                    cleaned = None
-
-        if cleaned is None:
-            cleaned = region_eraser.erase(
-                target_img,
-                boxes=[(bx, by, bw, bh)],
-                backend="lama",
-            )
+        cleaned = region_eraser.erase(
+            target_img,
+            boxes=[(bx, by, bw, bh)],
+            backend="lama",
+        )
         cv2.imwrite(str(out_path), cleaned)
         return jsonify({
             "status": "ok",
@@ -1233,6 +1206,58 @@ def reclean(job_id):
         return jsonify({"status": "ok", "job_id": job_id})
     else:
         return jsonify({"error": "Unsupported file format"}), 400
+
+
+def get_downloads_folder():
+    """Returns user's default Downloads directory on Windows, macOS, or Linux."""
+    if sys.platform == "win32":
+        try:
+            import winreg
+            sub_key = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, sub_key) as key:
+                val, _ = winreg.QueryValueEx(key, "{374DE290-123F-4565-9164-39C4925E467B}")
+                if os.path.isdir(val):
+                    return Path(val)
+        except Exception:
+            pass
+    return Path.home() / "Downloads"
+
+
+@app.route("/api/save_to_downloads/<job_id>", methods=["POST"])
+def save_to_downloads(job_id):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if not job or job.get("stage") != "done":
+        abort(404)
+
+    out_path = Path(job.get("out_path", ""))
+    if not out_path.exists():
+        return jsonify({"error": "Cleaned file not found"}), 404
+
+    try:
+        dl_dir = get_downloads_folder()
+        dl_dir.mkdir(parents=True, exist_ok=True)
+
+        orig_name = job.get("filename", "clean_file")
+        stem = Path(orig_name).stem
+        ext = out_path.suffix or Path(orig_name).suffix
+        clean_name = f"removix_{stem}{ext}"
+
+        dest = dl_dir / clean_name
+        counter = 1
+        while dest.exists():
+            dest = dl_dir / f"removix_{stem}_{counter}{ext}"
+            counter += 1
+
+        shutil.copy2(out_path, dest)
+        return jsonify({
+            "status": "ok",
+            "filename": dest.name,
+            "path": str(dest),
+            "message": f"Saved directly to Downloads folder: {dest.name}"
+        })
+    except Exception as err:
+        return jsonify({"error": str(err)}), 500
 
 
 @app.route("/api/download/<job_id>")
@@ -2605,45 +2630,70 @@ PAGE = r"""<!doctype html>
     box-shadow: 0 0 12px rgba(2, 132, 199, 0.4);
     box-sizing: border-box;
   }
-  .box-selection-rect.snapped {
-    border: 2px solid #38bdf8;
-    background: rgba(56, 189, 248, 0.28);
-    box-shadow: 0 0 16px rgba(56, 189, 248, 0.65);
-  }
   .box-floating-bar {
     position: absolute;
     display: flex;
     align-items: center;
     gap: 8px;
     background: #0f172a;
-    border: 1px solid rgba(255, 255, 255, 0.16);
+    border: 1px solid rgba(255, 255, 255, 0.18);
     color: #ffffff;
-    padding: 6px 10px;
+    padding: 6px 12px;
     border-radius: 8px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
     font-size: 12px;
     font-weight: 600;
     z-index: 50;
     white-space: nowrap;
     box-sizing: border-box;
+    cursor: grab;
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: none;
   }
-  .box-status-pill {
+  .box-floating-bar:active {
+    cursor: grabbing;
+  }
+  .box-drag-handle {
+    color: #94a3b8;
+    font-size: 15px;
+    line-height: 1;
+    cursor: grab;
     display: inline-flex;
     align-items: center;
-    gap: 5px;
-    font-size: 11.5px;
-    color: #94a3b8;
+    padding-right: 2px;
+    user-select: none;
+  }
+  .box-status-text {
+    font-size: 12px;
+    color: #f1f5f9;
     font-weight: 600;
+    user-select: none;
   }
-  .box-status-pill.detected {
+  .removix-toast {
+    position: fixed;
+    bottom: 30px;
+    left: 50%;
+    transform: translateX(-50%) translateY(30px);
+    background: #0f172a;
     color: #38bdf8;
+    border: 1px solid rgba(56, 189, 248, 0.4);
+    padding: 11px 24px;
+    border-radius: 9999px;
+    font-size: 13.5px;
+    font-weight: 700;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+    opacity: 0;
+    pointer-events: none;
+    transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+    z-index: 99999;
+    display: flex;
+    align-items: center;
+    gap: 8px;
   }
-  .box-status-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: #38bdf8;
-    display: inline-block;
+  .removix-toast.show {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
   }
   .btn-box-erase {
     background: #0284c7;
@@ -3164,11 +3214,9 @@ PAGE = r"""<!doctype html>
           <!-- Interactive Box Eraser Overlay -->
           <div class="box-draw-overlay" id="box-draw-overlay" style="display:none;">
             <div class="box-selection-rect" id="box-selection-rect" style="display:none;"></div>
-            <div class="box-floating-bar" id="box-floating-bar" style="display:none;">
-              <span class="box-status-pill" id="box-status-pill">
-                <span class="box-status-dot"></span>
-                <span id="box-status-text">Selected Area</span>
-              </span>
+            <div class="box-floating-bar" id="box-floating-bar" style="display:none;" title="Drag anywhere to move bar">
+              <span class="box-drag-handle" title="Drag to move">⠿</span>
+              <span class="box-status-text" id="box-status-text">Selected Area</span>
               <button type="button" class="btn-box-erase" id="btn-box-erase" onclick="submitBoxErase()">⚡ Erase with AI</button>
               <button type="button" class="btn-box-cancel" onclick="cancelBoxSelection()" title="Cancel">✕</button>
             </div>
@@ -3433,7 +3481,45 @@ function setZone(zone) {
   if (btn) btn.classList.add('active');
 }
 
+function showToast(msg) {
+  let toast = document.getElementById('removix-toast');
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.id = 'removix-toast';
+    toast.className = 'removix-toast';
+    document.body.appendChild(toast);
+  }
+  toast.textContent = msg;
+  toast.classList.add('show');
+  clearTimeout(toast._timer);
+  toast._timer = setTimeout(() => {
+    toast.classList.remove('show');
+  }, 3500);
+}
+
 function triggerDownload() {
+  if (!currentJobId) return;
+
+  const isDesktop = !!(window.pywebview || window.__removix_desktop);
+
+  fetch('/api/save_to_downloads/' + currentJobId, { method: 'POST' })
+    .then(r => r.json())
+    .then(data => {
+      if (data && data.status === 'ok') {
+        showToast('✓ Saved to Downloads: ' + data.filename);
+        if (!isDesktop) {
+          fallbackBrowserDownload();
+        }
+      } else {
+        fallbackBrowserDownload();
+      }
+    })
+    .catch(() => {
+      fallbackBrowserDownload();
+    });
+}
+
+function fallbackBrowserDownload() {
   if (!currentDownloadUrl) return;
   const a = document.createElement('a');
   a.href = currentDownloadUrl;
@@ -3457,9 +3543,7 @@ if (dlCheckbox) {
   dlCheckbox.addEventListener('click', (e) => {
     if (isDownloadComplete) {
       e.preventDefault();
-      if (currentDownloadUrl) {
-        window.open(currentDownloadUrl, '_blank');
-      }
+      triggerDownload();
     }
   });
 }
@@ -3614,26 +3698,15 @@ function setResultMode(mode) {
   }
 }
 
-let detectAbortCtrl = null;
-
 function cancelBoxSelection() {
   activeBox = null;
-  if (detectAbortCtrl) {
-    try { detectAbortCtrl.abort(); } catch(e) {}
-    detectAbortCtrl = null;
-  }
   const rectEl = document.getElementById('box-selection-rect');
   const floatBar = document.getElementById('box-floating-bar');
-  const statusPill = document.getElementById('box-status-pill');
-  const statusText = document.getElementById('box-status-text');
   if (rectEl) {
     rectEl.style.display = 'none';
     rectEl.style.transition = 'none';
-    rectEl.classList.remove('snapped');
   }
   if (floatBar) floatBar.style.display = 'none';
-  if (statusPill) statusPill.classList.remove('detected');
-  if (statusText) statusText.textContent = 'Selected Area';
 }
 
 function positionFloatBar() {
@@ -3642,9 +3715,9 @@ function positionFloatBar() {
   if (!overlay || !floatBar || !activeBox) return;
 
   floatBar.style.display = 'flex';
-  const barWidth = floatBar.offsetWidth || 240;
+  const barWidth = floatBar.offsetWidth || 230;
   const barHeight = floatBar.offsetHeight || 38;
-  const pad = 10;
+  const pad = 8;
   const ovW = overlay.clientWidth;
   const ovH = overlay.clientHeight;
 
@@ -3679,73 +3752,50 @@ function positionFloatBar() {
   floatBar.style.left = Math.round(barLeft) + 'px';
 }
 
-function autoDetectWatermarkInBox() {
-  if (!activeBox || !currentJobId) return;
-  const afterImg = document.getElementById('user-img-after');
+let isDraggingBar = false;
+let barDragStartX = 0, barDragStartY = 0;
+let barInitialLeft = 0, barInitialTop = 0;
+
+function initFloatBarDraggable() {
+  const floatBar = document.getElementById('box-floating-bar');
   const overlay = document.getElementById('box-draw-overlay');
-  const rectEl = document.getElementById('box-selection-rect');
-  const statusText = document.getElementById('box-status-text');
-  const statusPill = document.getElementById('box-status-pill');
-  if (!afterImg || !overlay || !rectEl) return;
+  if (!floatBar || !overlay || floatBar._hasDragInit) return;
+  floatBar._hasDragInit = true;
 
-  const r = overlay.getBoundingClientRect();
-  const naturalW = afterImg.naturalWidth || r.width;
-  const naturalH = afterImg.naturalHeight || r.height;
-  const scaleX = naturalW / r.width;
-  const scaleY = naturalH / r.height;
-  const imgX = Math.max(0, Math.round(activeBox.x * scaleX));
-  const imgY = Math.max(0, Math.round(activeBox.y * scaleY));
-  const imgW = Math.min(naturalW - imgX, Math.round(activeBox.w * scaleX));
-  const imgH = Math.min(naturalH - imgY, Math.round(activeBox.h * scaleY));
-
-  if (statusText) statusText.textContent = '🔍 AI analyzing...';
-
-  if (detectAbortCtrl) {
-    try { detectAbortCtrl.abort(); } catch(e) {}
-  }
-  detectAbortCtrl = new AbortController();
-
-  fetch('/api/detect_box/' + currentJobId, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ box: [imgX, imgY, imgW, imgH] }),
-    signal: detectAbortCtrl.signal
-  })
-  .then(res => res.json())
-  .then(data => {
-    if (data.status === 'ok' && data.detected && data.box) {
-      const [nx, ny, nw, nh] = data.box;
-      const snapX = nx / scaleX;
-      const snapY = ny / scaleY;
-      const snapW = nw / scaleX;
-      const snapH = nh / scaleY;
-
-      // Animate box snapping to exact detected watermark
-      rectEl.style.transition = 'all 0.22s cubic-bezier(0.16, 1, 0.3, 1)';
-      rectEl.style.left = snapX + 'px';
-      rectEl.style.top = snapY + 'px';
-      rectEl.style.width = snapW + 'px';
-      rectEl.style.height = snapH + 'px';
-      rectEl.classList.add('snapped');
-
-      activeBox = { x: snapX, y: snapY, w: snapW, h: snapH };
-      setTimeout(() => {
-        rectEl.style.transition = 'none';
-        positionFloatBar();
-      }, 230);
-
-      if (statusText) statusText.textContent = '✨ Watermark Detected';
-      if (statusPill) statusPill.classList.add('detected');
-    } else {
-      if (statusText) statusText.textContent = 'Selected Area';
-      if (statusPill) statusPill.classList.remove('detected');
-    }
-  })
-  .catch(err => {
-    if (err.name === 'AbortError') return;
-    if (statusText) statusText.textContent = 'Selected Area';
-    if (statusPill) statusPill.classList.remove('detected');
+  floatBar.addEventListener('pointerdown', (e) => {
+    if (e.target.closest('button')) return;
+    isDraggingBar = true;
+    barDragStartX = e.clientX;
+    barDragStartY = e.clientY;
+    barInitialLeft = parseFloat(floatBar.style.left) || 0;
+    barInitialTop = parseFloat(floatBar.style.top) || 0;
+    try { floatBar.setPointerCapture(e.pointerId); } catch(err) {}
+    e.stopPropagation();
   });
+
+  floatBar.addEventListener('pointermove', (e) => {
+    if (!isDraggingBar) return;
+    const dx = e.clientX - barDragStartX;
+    const dy = e.clientY - barDragStartY;
+    const maxLeft = Math.max(6, overlay.clientWidth - floatBar.offsetWidth - 6);
+    const maxTop = Math.max(6, overlay.clientHeight - floatBar.offsetHeight - 6);
+    const newLeft = Math.max(6, Math.min(maxLeft, barInitialLeft + dx));
+    const newTop = Math.max(6, Math.min(maxTop, barInitialTop + dy));
+    floatBar.style.left = Math.round(newLeft) + 'px';
+    floatBar.style.top = Math.round(newTop) + 'px';
+    e.stopPropagation();
+  });
+
+  const stopBarDrag = (e) => {
+    if (isDraggingBar) {
+      isDraggingBar = false;
+      try { floatBar.releasePointerCapture(e.pointerId); } catch(err) {}
+      e.stopPropagation();
+    }
+  };
+
+  floatBar.addEventListener('pointerup', stopBarDrag);
+  floatBar.addEventListener('pointercancel', stopBarDrag);
 }
 
 function initBoxEraserEvents() {
@@ -3753,6 +3803,8 @@ function initBoxEraserEvents() {
   const rectEl = document.getElementById('box-selection-rect');
   const floatBar = document.getElementById('box-floating-bar');
   if (!overlay || !rectEl || !floatBar) return;
+
+  initFloatBarDraggable();
 
   const onDown = (e) => {
     if (e.target.closest('#box-floating-bar')) return;
@@ -3764,7 +3816,6 @@ function initBoxEraserEvents() {
     floatBar.style.display = 'none';
     rectEl.style.display = 'block';
     rectEl.style.transition = 'none';
-    rectEl.classList.remove('snapped');
     rectEl.style.left = boxStartX + 'px';
     rectEl.style.top = boxStartY + 'px';
     rectEl.style.width = '0px';
@@ -3797,7 +3848,6 @@ function initBoxEraserEvents() {
       return;
     }
     positionFloatBar();
-    autoDetectWatermarkInBox();
   };
 
   overlay.addEventListener('pointerdown', onDown);
