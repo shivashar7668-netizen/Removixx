@@ -29,6 +29,10 @@ from pathlib import Path
 
 from flask import Flask, request, jsonify, send_file, abort, Response
 
+SRC_DIR = Path(__file__).resolve().parent / "src"
+if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
 UV_SITE_PACKAGES = Path.home() / "AppData" / "Roaming" / "uv" / "tools" / "remove-ai-watermarks" / "Lib" / "site-packages"
 if UV_SITE_PACKAGES.exists() and str(UV_SITE_PACKAGES) not in sys.path:
     sys.path.insert(0, str(UV_SITE_PACKAGES))
@@ -173,6 +177,8 @@ def sanitize_error_message(raw_msg: str, is_video: bool = False) -> str:
 
 
 def process_image_direct(job_id, in_path, out_path):
+    import cv2
+    import numpy as np
     from remove_ai_watermarks.api import remove_visible_detailed
 
     set_job(job_id, stage="scanning", percent=10, message="Analyzing image and AI provenance...")
@@ -185,13 +191,73 @@ def process_image_direct(job_id, in_path, out_path):
 
     def run_worker():
         try:
-            result_container["report"] = remove_visible_detailed(
-                in_path,
-                out_path,
-                backend="lama",
-                strip_metadata=True,
-                write_noop=True,
-            )
+            # Check image dimensions for memory safety on cloud containers
+            img = cv2.imread(str(in_path))
+            if img is not None:
+                h, w = img.shape[:2]
+                max_dim = max(h, w)
+                
+                # If image is high-res (e.g. > 1280px), extract watermark patch to prevent OOM
+                if max_dim > 1280:
+                    y0, x0 = int(h * 0.65), int(w * 0.65)
+                    patch = img[y0:, x0:].copy()
+                    
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as p_in, \
+                         tempfile.NamedTemporaryFile(suffix=".png", delete=False) as p_out:
+                        p_in_name = p_in.name
+                        p_out_name = p_out.name
+                    
+                    try:
+                        cv2.imwrite(p_in_name, patch)
+                        patch_report = remove_visible_detailed(
+                            p_in_name,
+                            p_out_name,
+                            backend="lama",
+                            strip_metadata=False,
+                            write_noop=True,
+                        )
+                        cleaned_patch = cv2.imread(p_out_name)
+                        if cleaned_patch is not None and patch_report.labels:
+                            # Seamless feather blending into original high-res image
+                            ph, pw = patch.shape[:2]
+                            feather = min(32, ph // 6, pw // 6)
+                            mask = np.ones((ph, pw), dtype=np.float32)
+                            for i in range(feather):
+                                mask[i, :] *= (i / feather)
+                                mask[:, i] *= (i / feather)
+                            
+                            blended = img.copy()
+                            for c in range(3):
+                                blended[y0:, x0:, c] = (
+                                    img[y0:, x0:, c] * (1.0 - mask) + cleaned_patch[:, :, c] * mask
+                                ).astype(np.uint8)
+                            
+                            cv2.imwrite(str(out_path), blended)
+                            result_container["report"] = patch_report
+                            return
+                    except Exception:
+                        pass
+                    finally:
+                        Path(p_in_name).unlink(missing_ok=True)
+                        Path(p_out_name).unlink(missing_ok=True)
+
+            # Standard processing
+            try:
+                result_container["report"] = remove_visible_detailed(
+                    in_path,
+                    out_path,
+                    backend="lama",
+                    strip_metadata=True,
+                    write_noop=True,
+                )
+            except Exception:
+                result_container["report"] = remove_visible_detailed(
+                    in_path,
+                    out_path,
+                    backend="auto",
+                    strip_metadata=True,
+                    write_noop=True,
+                )
         except Exception as e:
             result_container["error"] = e
         finally:
@@ -518,8 +584,29 @@ def home():
 
 
 @app.route("/health")
+@app.route("/api/health")
 def health():
-    return {"status": "ok"}
+    return jsonify({"status": "ok", "service": "removix", "timestamp": time.time()})
+
+
+def _render_keep_alive():
+    """Background keep-alive thread: keeps Render free tier awake by pinging itself every 9 minutes."""
+    if not os.environ.get("RENDER"):
+        return
+    import urllib.request
+    time.sleep(45)  # Wait 45s after startup
+    url = os.environ.get("KEEP_ALIVE_URL", "https://removix.sanvox.in/health")
+    while True:
+        try:
+            time.sleep(540)  # 9 minutes (< 15 min Render idle timeout)
+            req = urllib.request.Request(url, headers={"User-Agent": "Removix-SelfPinger/1.0"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                pass
+        except Exception:
+            pass
+
+
+threading.Thread(target=_render_keep_alive, daemon=True).start()
 
 
 @app.route("/api/upload", methods=["POST"])

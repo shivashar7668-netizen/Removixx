@@ -226,7 +226,13 @@ def _get_session(name: str, repo_id: str, filename: str, label: str) -> object:
 
     model_path = hf_hub_download(repo_id=repo_id, filename=filename)
     logger.info("Loading %s model: %s", label, model_path)
-    session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+
+    opts = ort.SessionOptions()
+    opts.enable_cpu_mem_arena = False
+    opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    opts.intra_op_num_threads = 1
+    opts.inter_op_num_threads = 1
+    session = ort.InferenceSession(model_path, sess_options=opts, providers=["CPUExecutionProvider"])
     _sessions[name] = session
     return session
 
