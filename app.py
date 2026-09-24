@@ -1866,7 +1866,7 @@ PAGE = r"""<!doctype html>
   #homepage-split-slider {
     width: 100%;
     max-width: 100%;
-    aspect-ratio: 1856 / 2304;
+    aspect-ratio: 1684 / 2528;
     padding: 0;
     margin: 0 auto;
     overflow: hidden;
@@ -2485,11 +2485,11 @@ PAGE = r"""<!doctype html>
     <div class="comp-visuals-wrapper">
       <div class="split-slider-container" id="homepage-split-slider">
         <div class="split-layer split-before">
-          <img src="/static/before.webp?v=4" width="1856" height="2304" alt="Original" class="split-img" loading="eager">
+          <img src="/static/before.webp?v=5" width="1684" height="2528" alt="Original" class="split-img" loading="eager">
           <span class="split-label before-label">Original</span>
         </div>
         <div class="split-layer split-after" id="homepage-split-after">
-          <img src="/static/after.webp?v=4" width="1856" height="2304" alt="After - Watermark Removed" class="split-img" loading="eager">
+          <img src="/static/after.webp?v=5" width="1684" height="2528" alt="After - Watermark Removed" class="split-img" loading="eager">
           <span class="split-label after-label">Watermark Removed</span>
         </div>
         <div class="split-handle" id="homepage-split-handle">
