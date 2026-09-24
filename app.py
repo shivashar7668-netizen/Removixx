@@ -103,17 +103,18 @@ def _patch_lama_engine():
 
 _patch_lama_engine()
 
-# Pre-warm: load LaMa model in background so first user request doesn't wait ~15s
-def _prewarm_lama():
-    try:
-        from remove_ai_watermarks.region_eraser import _get_lama_session
-        _get_lama_session()
-        import gc
-        gc.collect()
-    except Exception:
-        pass
+# Avoid pre-warming on memory-tight cloud containers (Render 512MB RAM limit)
+if not os.environ.get("RENDER"):
+    def _prewarm_lama():
+        try:
+            from remove_ai_watermarks.region_eraser import _get_lama_session
+            _get_lama_session()
+            import gc
+            gc.collect()
+        except Exception:
+            pass
 
-threading.Thread(target=_prewarm_lama, daemon=True).start()
+    threading.Thread(target=_prewarm_lama, daemon=True).start()
 
 CLI = shutil.which("remove-ai-watermarks") or str(
     Path.home() / ".local" / "bin" / "remove-ai-watermarks.exe"
