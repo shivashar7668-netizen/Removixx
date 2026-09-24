@@ -1903,6 +1903,10 @@ PAGE = r"""<!doctype html>
     pointer-events: none;
     background: transparent !important;
   }
+  #homepage-split-slider img,
+  #homepage-split-slider .split-img {
+    object-position: center 80% !important;
+  }
   .split-before {
     clip-path: polygon(0 0, 50% 0, 50% 100%, 0 100%);
     z-index: 2;
@@ -2485,11 +2489,11 @@ PAGE = r"""<!doctype html>
     <div class="comp-visuals-wrapper">
       <div class="split-slider-container" id="homepage-split-slider">
         <div class="split-layer split-before">
-          <img src="/static/before.webp?v=6" width="1684" height="2528" alt="Original" class="split-img" loading="eager">
+          <img src="/static/before.webp?v=7" width="1684" height="2528" alt="Original" class="split-img" loading="eager">
           <span class="split-label before-label">Original</span>
         </div>
         <div class="split-layer split-after" id="homepage-split-after">
-          <img src="/static/after.webp?v=6" width="1684" height="2528" alt="After - Watermark Removed" class="split-img" loading="eager">
+          <img src="/static/after.webp?v=7" width="1684" height="2528" alt="After - Watermark Removed" class="split-img" loading="eager">
           <span class="split-label after-label">Watermark Removed</span>
         </div>
         <div class="split-handle" id="homepage-split-handle">
