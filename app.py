@@ -58,8 +58,10 @@ def _patch_lama_engine():
             model_path = hf_hub_download(repo_id=repo_id, filename=filename)
 
             so = ort.SessionOptions()
+            so.enable_cpu_mem_arena = False
+            so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
             so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            so.intra_op_num_threads = os.cpu_count() or 4
+            so.intra_op_num_threads = min(os.cpu_count() or 1, 2)
 
             available = ort.get_available_providers()
             session = None
@@ -81,7 +83,7 @@ def _patch_lama_engine():
                         "GPU initialization failed (%s); falling back to CPU", gpu_err
                     )
 
-            # 2. Fallback to CPU with multi-threading
+            # 2. Fallback to CPU with low memory
             if session is None:
                 session = ort.InferenceSession(
                     model_path,
@@ -106,6 +108,8 @@ def _prewarm_lama():
     try:
         from remove_ai_watermarks.region_eraser import _get_lama_session
         _get_lama_session()
+        import gc
+        gc.collect()
     except Exception:
         pass
 
@@ -189,6 +193,9 @@ def process_image_direct(job_id, in_path, out_path):
             )
         except Exception as e:
             result_container["error"] = e
+        finally:
+            import gc
+            gc.collect()
 
     worker_thread = threading.Thread(target=run_worker, daemon=True)
     worker_thread.start()
