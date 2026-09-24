@@ -20,12 +20,16 @@ def build():
     print("  Mode: Windowed (No CMD) | Icon: removix.ico | GPU: DirectML/CUDA/CPU")
     print("=" * 65)
     
+    import shutil
+    shutil.rmtree(ROOT / "build", ignore_errors=True)
+    
     datas = [
         f"{ROOT / 'src'};src",
         f"{ROOT / 'before.webp'};.",
         f"{ROOT / 'after.webp'};.",
         f"{ROOT / 'removix.png'};.",
         f"{ROOT / 'removix.ico'};.",
+        f"{ROOT / 'removix.svg'};.",
         f"{ROOT / 'lottie.min.js'};.",
         f"{ROOT / 'lottie_scan.json'};.",
     ]

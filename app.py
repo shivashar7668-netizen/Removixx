@@ -801,6 +801,7 @@ def get_after_img():
 
 REMOVIX_PNG = BUNDLE_DIR / "removix.png"
 REMOVIX_ICO = BUNDLE_DIR / "removix.ico"
+REMOVIX_SVG = BUNDLE_DIR / "removix.svg"
 
 
 @app.route("/favicon.ico")
@@ -812,10 +813,22 @@ def get_favicon_ico():
     abort(404)
 
 
-@app.route("/static/removix.png")
-@app.route("/static/removix-logo.png")
+@app.route("/static/removix.svg")
 @app.route("/static/removix-logo.svg")
 @app.route("/favicon.svg")
+def get_removix_svg():
+    if REMOVIX_SVG.exists():
+        resp = send_file(REMOVIX_SVG, mimetype="image/svg+xml")
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return resp
+    if REMOVIX_PNG.exists():
+        resp = send_file(REMOVIX_PNG, mimetype="image/png")
+        return resp
+    abort(404)
+
+
+@app.route("/static/removix.png")
+@app.route("/static/removix-logo.png")
 @app.route("/favicon.png")
 def get_removix_logo():
     if REMOVIX_PNG.exists():
@@ -895,22 +908,21 @@ PAGE = r"""<!doctype html>
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    gap: 1px;
+    gap: 0px;
     background: #ffffff;
-    padding: 7px 22px 7px 18px;
+    padding: 6px 20px 6px 16px;
     border-radius: 9999px;
     border: 1px solid rgba(226, 232, 240, 0.9);
     box-shadow: 0 4px 16px rgba(15, 23, 42, 0.04);
   }
   .brand-icon {
-    width: 26px;
-    height: 26px;
+    width: 27px;
+    height: 27px;
     display: flex;
     align-items: center;
     justify-content: center;
-    overflow: hidden;
+    overflow: visible;
     flex-shrink: 0;
-    border-radius: 6px;
   }
   .brand-icon img, .brand-logo-img {
     width: 100%;
@@ -920,11 +932,12 @@ PAGE = r"""<!doctype html>
   }
   .brand-icon svg { width: 16px; height: 16px; fill: white; }
   .brand-name {
-    font-size: 21px;
+    font-size: 21.5px;
     font-weight: 800;
     letter-spacing: -0.03em;
     color: var(--ink);
     line-height: 1;
+    margin-left: 0px;
   }
   .brand-name span { color: var(--sky); }
 
@@ -2329,7 +2342,7 @@ PAGE = r"""<!doctype html>
 <header class="top-header">
   <div class="brand-badge">
     <div class="brand-icon">
-      <img src="/static/removix.png?v=3" alt="Removix Logo" class="brand-logo-img">
+      <img src="/static/removix.svg?v=5" alt="Removix Logo" class="brand-logo-img">
     </div>
     <span class="brand-name">emovix</span>
   </div>
