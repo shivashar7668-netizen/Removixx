@@ -999,6 +999,151 @@ def preview(job_id, which):
     return send_file(p, mimetype=mimetype)
 
 
+def detect_watermark_in_box(img, box):
+    """Accurately detect and snap to watermark text or logo within a user-drawn bounding box."""
+    import cv2
+    import numpy as np
+
+    if img is None or img.size == 0 or not box or len(box) != 4:
+        return {"detected": False, "box": box, "label": "Selected area"}
+
+    h_img, w_img = img.shape[:2]
+    bx, by, bw, bh = box
+    bx = max(0, min(w_img - 1, int(bx)))
+    by = max(0, min(h_img - 1, int(by)))
+    bw = max(1, min(w_img - bx, int(bw)))
+    bh = max(1, min(h_img - by, int(bh)))
+
+    # 1. Registered Gemini AI watermark check
+    try:
+        from remove_ai_watermarks.gemini_engine import GeminiEngine
+        engine = GeminiEngine()
+        det = engine.detect_watermark(img, trust_provenance=True)
+        if det.detected and det.region:
+            gx, gy, gw, gh = det.region
+            ix1 = max(bx, gx)
+            iy1 = max(by, gy)
+            ix2 = min(bx + bw, gx + gw)
+            iy2 = min(by + bh, gy + gh)
+            if ix2 > ix1 and iy2 > iy1:
+                return {
+                    "detected": True,
+                    "type": "gemini",
+                    "box": [int(gx), int(gy), int(gw), int(gh)],
+                    "label": "Gemini AI watermark detected",
+                }
+    except Exception:
+        pass
+
+    # 2. Universal watermark text/logo feature analysis on the subregion crop
+    crop = img[by:by+bh, bx:bx+bw]
+    if crop.shape[0] < 8 or crop.shape[1] < 8:
+        return {"detected": False, "box": [bx, by, bw, bh], "label": "Selected area"}
+
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    k_size = max(3, min(15, min(bw, bh) // 4))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_size, k_size))
+    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
+    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
+    contrast = cv2.max(tophat, blackhat)
+
+    grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.magnitude(grad_x, grad_y)
+    mag = np.uint8(np.clip(mag / (mag.max() + 1e-5) * 255.0, 0, 255))
+
+    combined = cv2.max(contrast, mag)
+    _, thresh = cv2.threshold(combined, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    thresh_clean = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, close_kernel)
+
+    contours, _ = cv2.findContours(thresh_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    rects = []
+    total_crop_area = bw * bh
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 8:
+            continue
+        cx, cy, cw, ch = cv2.boundingRect(cnt)
+        if cw > 0.95 * bw and ch > 0.95 * bh:
+            continue
+        rects.append((cx, cy, cw, ch))
+
+    if rects:
+        min_x = min(r[0] for r in rects)
+        min_y = min(r[1] for r in rects)
+        max_x = max(r[0] + r[2] for r in rects)
+        max_y = max(r[1] + r[3] for r in rects)
+
+        union_w = max_x - min_x
+        union_h = max_y - min_y
+        union_area = union_w * union_h
+
+        # If detected components form a cohesive watermark cluster inside the selection:
+        if 0.05 * total_crop_area <= union_area <= 0.92 * total_crop_area and union_w >= 8 and union_h >= 8:
+            pad = 6
+            snapped_bx = max(0, bx + min_x - pad)
+            snapped_by = max(0, by + min_y - pad)
+            snapped_bw = min(w_img - snapped_bx, union_w + 2 * pad)
+            snapped_bh = min(h_img - snapped_by, union_h + 2 * pad)
+            return {
+                "detected": True,
+                "type": "watermark",
+                "box": [int(snapped_bx), int(snapped_by), int(snapped_bw), int(snapped_bh)],
+                "label": "Watermark detected",
+            }
+
+    return {
+        "detected": False,
+        "type": "manual",
+        "box": [bx, by, bw, bh],
+        "label": "Manual selection",
+    }
+
+
+@app.route("/api/detect_box/<job_id>", methods=["POST"])
+def detect_box(job_id):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if not job:
+        abort(404)
+
+    data = request.get_json(silent=True) or request.form or {}
+    box = data.get("box")
+    if isinstance(box, str):
+        try:
+            box = [int(float(v.strip())) for v in box.split(",") if v.strip()]
+        except Exception:
+            box = None
+
+    if not box or len(box) != 4:
+        return jsonify({"error": "Invalid box coordinates"}), 400
+
+    ext = Path(job.get("filename", "")).suffix.lower()
+    job_dir = WORKDIR / job_id
+
+    import cv2
+    img = None
+    if ext in VIDEO_EXTS:
+        p = job_dir / "preview_input.jpg"
+        if not p.exists():
+            p = job_dir / "preview_output.jpg"
+        if p.exists():
+            img = cv2.imread(str(p))
+    else:
+        p = job_dir / f"input{ext}"
+        if not p.exists():
+            p = Path(job.get("out_path", ""))
+        if p.exists():
+            img = cv2.imread(str(p))
+
+    if img is None:
+        return jsonify({"status": "ok", "detected": False, "box": box, "label": "Manual selection"})
+
+    result = detect_watermark_in_box(img, box)
+    return jsonify({"status": "ok", **result})
+
+
 @app.route("/api/reclean/<job_id>", methods=["POST"])
 def reclean(job_id):
     with JOBS_LOCK:
@@ -1023,6 +1168,7 @@ def reclean(job_id):
 
     if ext in IMAGE_EXTS:
         import cv2
+        import numpy as np
         from remove_ai_watermarks import region_eraser
 
         target_img = cv2.imread(str(out_path))
@@ -1033,11 +1179,38 @@ def reclean(job_id):
             return jsonify({"error": "Could not read image file"}), 500
 
         bx, by, bw, bh = box
-        cleaned = region_eraser.erase(
-            target_img,
-            boxes=[(bx, by, bw, bh)],
-            backend="lama",
-        )
+        cleaned = None
+        crop = target_img[by:by+bh, bx:bx+bw]
+        h_c, w_c = crop.shape[:2]
+        if h_c >= 8 and w_c >= 8:
+            gray_c = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            k_size = max(3, min(15, min(w_c, h_c) // 4))
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_size, k_size))
+            contrast_c = cv2.max(cv2.morphologyEx(gray_c, cv2.MORPH_TOPHAT, kernel),
+                                 cv2.morphologyEx(gray_c, cv2.MORPH_BLACKHAT, kernel))
+            grad_x = cv2.Sobel(gray_c, cv2.CV_32F, 1, 0, ksize=3)
+            grad_y = cv2.Sobel(gray_c, cv2.CV_32F, 0, 1, ksize=3)
+            mag_c = cv2.magnitude(grad_x, grad_y)
+            mag_c = np.uint8(np.clip(mag_c / (mag_c.max() + 1e-5) * 255.0, 0, 255))
+            comb_c = cv2.max(contrast_c, mag_c)
+            _, thresh_c = cv2.threshold(comb_c, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            mask_ratio = cv2.countNonZero(thresh_c) / float(max(1, w_c * h_c))
+            if 0.05 <= mask_ratio <= 0.85:
+                dilate_k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+                dilated_c = cv2.dilate(thresh_c, dilate_k, iterations=1)
+                full_mask = np.zeros(target_img.shape[:2], dtype=np.uint8)
+                full_mask[by:by+bh, bx:bx+bw] = dilated_c
+                try:
+                    cleaned = region_eraser.erase(target_img, mask=full_mask, backend="lama")
+                except Exception:
+                    cleaned = None
+
+        if cleaned is None:
+            cleaned = region_eraser.erase(
+                target_img,
+                boxes=[(bx, by, bw, bh)],
+                backend="lama",
+            )
         cv2.imwrite(str(out_path), cleaned)
         return jsonify({
             "status": "ok",
@@ -2426,10 +2599,16 @@ PAGE = r"""<!doctype html>
   .box-selection-rect {
     position: absolute;
     border: 2px dashed #0284c7;
-    background: rgba(14, 165, 233, 0.25);
-    border-radius: 4px;
+    background: rgba(14, 165, 233, 0.22);
+    border-radius: 5px;
     pointer-events: none;
     box-shadow: 0 0 12px rgba(2, 132, 199, 0.4);
+    box-sizing: border-box;
+  }
+  .box-selection-rect.snapped {
+    border: 2px solid #38bdf8;
+    background: rgba(56, 189, 248, 0.28);
+    box-shadow: 0 0 16px rgba(56, 189, 248, 0.65);
   }
   .box-floating-bar {
     position: absolute;
@@ -2437,15 +2616,34 @@ PAGE = r"""<!doctype html>
     align-items: center;
     gap: 8px;
     background: #0f172a;
+    border: 1px solid rgba(255, 255, 255, 0.16);
     color: #ffffff;
-    padding: 6px 12px;
+    padding: 6px 10px;
     border-radius: 8px;
-    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
     font-size: 12px;
     font-weight: 600;
     z-index: 50;
-    transform: translateY(8px);
     white-space: nowrap;
+    box-sizing: border-box;
+  }
+  .box-status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11.5px;
+    color: #94a3b8;
+    font-weight: 600;
+  }
+  .box-status-pill.detected {
+    color: #38bdf8;
+  }
+  .box-status-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #38bdf8;
+    display: inline-block;
   }
   .btn-box-erase {
     background: #0284c7;
@@ -2940,7 +3138,7 @@ PAGE = r"""<!doctype html>
         </button>
         <button type="button" class="mode-btn" id="btn-mode-eraser" onclick="setResultMode('eraser')">
           <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" stroke-dasharray="3 3"/><path d="M7 17l10-10"/></svg>
-          ⛶ Select & Erase Watermark
+          Select & Erase Watermark
         </button>
       </div>
 
@@ -2967,9 +3165,12 @@ PAGE = r"""<!doctype html>
           <div class="box-draw-overlay" id="box-draw-overlay" style="display:none;">
             <div class="box-selection-rect" id="box-selection-rect" style="display:none;"></div>
             <div class="box-floating-bar" id="box-floating-bar" style="display:none;">
-              <span>Selected Area</span>
+              <span class="box-status-pill" id="box-status-pill">
+                <span class="box-status-dot"></span>
+                <span id="box-status-text">Selected Area</span>
+              </span>
               <button type="button" class="btn-box-erase" id="btn-box-erase" onclick="submitBoxErase()">⚡ Erase with AI</button>
-              <button type="button" class="btn-box-cancel" onclick="cancelBoxSelection()">✕</button>
+              <button type="button" class="btn-box-cancel" onclick="cancelBoxSelection()" title="Cancel">✕</button>
             </div>
             <div class="box-hint-badge" id="box-hint-badge">Drag mouse over watermark to select & erase</div>
           </div>
@@ -3413,12 +3614,138 @@ function setResultMode(mode) {
   }
 }
 
+let detectAbortCtrl = null;
+
 function cancelBoxSelection() {
   activeBox = null;
+  if (detectAbortCtrl) {
+    try { detectAbortCtrl.abort(); } catch(e) {}
+    detectAbortCtrl = null;
+  }
   const rectEl = document.getElementById('box-selection-rect');
   const floatBar = document.getElementById('box-floating-bar');
-  if (rectEl) rectEl.style.display = 'none';
+  const statusPill = document.getElementById('box-status-pill');
+  const statusText = document.getElementById('box-status-text');
+  if (rectEl) {
+    rectEl.style.display = 'none';
+    rectEl.style.transition = 'none';
+    rectEl.classList.remove('snapped');
+  }
   if (floatBar) floatBar.style.display = 'none';
+  if (statusPill) statusPill.classList.remove('detected');
+  if (statusText) statusText.textContent = 'Selected Area';
+}
+
+function positionFloatBar() {
+  const overlay = document.getElementById('box-draw-overlay');
+  const floatBar = document.getElementById('box-floating-bar');
+  if (!overlay || !floatBar || !activeBox) return;
+
+  floatBar.style.display = 'flex';
+  const barWidth = floatBar.offsetWidth || 240;
+  const barHeight = floatBar.offsetHeight || 38;
+  const pad = 10;
+  const ovW = overlay.clientWidth;
+  const ovH = overlay.clientHeight;
+
+  // Decide whether to place above or below the box
+  let barTop;
+  const spaceBelow = ovH - (activeBox.y + activeBox.h);
+  const spaceAbove = activeBox.y;
+
+  if (spaceBelow < barHeight + pad + 6 && spaceAbove >= barHeight + pad) {
+    // Not enough room below -> Place ABOVE the box
+    barTop = activeBox.y - barHeight - 8;
+  } else if (spaceBelow >= barHeight + pad + 6) {
+    // Plenty of room below -> Place BELOW the box
+    barTop = activeBox.y + activeBox.h + 8;
+  } else {
+    // Box covers most of vertical space, clamp inside
+    barTop = Math.max(pad, Math.min(ovH - barHeight - pad, activeBox.y + activeBox.h - barHeight - 8));
+  }
+
+  // Strictly clamp inside overlay vertical boundaries
+  barTop = Math.max(pad, Math.min(ovH - barHeight - pad, barTop));
+
+  // Horizontal position:
+  // Align with activeBox.x, but ensure it NEVER overflows right or left
+  let barLeft = activeBox.x;
+  if (barLeft + barWidth > ovW - pad) {
+    barLeft = ovW - barWidth - pad;
+  }
+  barLeft = Math.max(pad, barLeft);
+
+  floatBar.style.top = Math.round(barTop) + 'px';
+  floatBar.style.left = Math.round(barLeft) + 'px';
+}
+
+function autoDetectWatermarkInBox() {
+  if (!activeBox || !currentJobId) return;
+  const afterImg = document.getElementById('user-img-after');
+  const overlay = document.getElementById('box-draw-overlay');
+  const rectEl = document.getElementById('box-selection-rect');
+  const statusText = document.getElementById('box-status-text');
+  const statusPill = document.getElementById('box-status-pill');
+  if (!afterImg || !overlay || !rectEl) return;
+
+  const r = overlay.getBoundingClientRect();
+  const naturalW = afterImg.naturalWidth || r.width;
+  const naturalH = afterImg.naturalHeight || r.height;
+  const scaleX = naturalW / r.width;
+  const scaleY = naturalH / r.height;
+  const imgX = Math.max(0, Math.round(activeBox.x * scaleX));
+  const imgY = Math.max(0, Math.round(activeBox.y * scaleY));
+  const imgW = Math.min(naturalW - imgX, Math.round(activeBox.w * scaleX));
+  const imgH = Math.min(naturalH - imgY, Math.round(activeBox.h * scaleY));
+
+  if (statusText) statusText.textContent = '🔍 AI analyzing...';
+
+  if (detectAbortCtrl) {
+    try { detectAbortCtrl.abort(); } catch(e) {}
+  }
+  detectAbortCtrl = new AbortController();
+
+  fetch('/api/detect_box/' + currentJobId, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ box: [imgX, imgY, imgW, imgH] }),
+    signal: detectAbortCtrl.signal
+  })
+  .then(res => res.json())
+  .then(data => {
+    if (data.status === 'ok' && data.detected && data.box) {
+      const [nx, ny, nw, nh] = data.box;
+      const snapX = nx / scaleX;
+      const snapY = ny / scaleY;
+      const snapW = nw / scaleX;
+      const snapH = nh / scaleY;
+
+      // Animate box snapping to exact detected watermark
+      rectEl.style.transition = 'all 0.22s cubic-bezier(0.16, 1, 0.3, 1)';
+      rectEl.style.left = snapX + 'px';
+      rectEl.style.top = snapY + 'px';
+      rectEl.style.width = snapW + 'px';
+      rectEl.style.height = snapH + 'px';
+      rectEl.classList.add('snapped');
+
+      activeBox = { x: snapX, y: snapY, w: snapW, h: snapH };
+      setTimeout(() => {
+        rectEl.style.transition = 'none';
+        positionFloatBar();
+      }, 230);
+
+      if (statusText) statusText.textContent = '✨ Watermark Detected';
+      if (statusPill) statusPill.classList.add('detected');
+    } else {
+      if (statusText) statusText.textContent = 'Selected Area';
+      if (statusPill) statusPill.classList.remove('detected');
+    }
+  })
+  .catch(err => {
+    if (err.name === 'AbortError') return;
+    if (statusText) statusText.textContent = 'Selected Area';
+    if (statusPill) statusPill.classList.remove('detected');
+  });
 }
 
 function initBoxEraserEvents() {
@@ -3436,6 +3763,8 @@ function initBoxEraserEvents() {
     activeBox = null;
     floatBar.style.display = 'none';
     rectEl.style.display = 'block';
+    rectEl.style.transition = 'none';
+    rectEl.classList.remove('snapped');
     rectEl.style.left = boxStartX + 'px';
     rectEl.style.top = boxStartY + 'px';
     rectEl.style.width = '0px';
@@ -3467,17 +3796,15 @@ function initBoxEraserEvents() {
       cancelBoxSelection();
       return;
     }
-    floatBar.style.display = 'flex';
-    const barTop = Math.min(overlay.clientHeight - 48, activeBox.y + activeBox.h + 8);
-    const barLeft = Math.max(8, Math.min(overlay.clientWidth - 190, activeBox.x));
-    floatBar.style.top = barTop + 'px';
-    floatBar.style.left = barLeft + 'px';
+    positionFloatBar();
+    autoDetectWatermarkInBox();
   };
 
   overlay.addEventListener('pointerdown', onDown);
   overlay.addEventListener('pointermove', onMove);
   overlay.addEventListener('pointerup', onUp);
   overlay.addEventListener('pointercancel', () => { isDrawingBox = false; cancelBoxSelection(); });
+  window.addEventListener('resize', () => { if (activeBox) positionFloatBar(); });
 }
 
 function submitBoxErase() {
@@ -3534,7 +3861,6 @@ function submitBoxErase() {
       eraseBtn.disabled = false;
       eraseBtn.textContent = '⚡ Erase with AI';
     }
-    alert('Error: ' + err.message);
   });
 }
 
