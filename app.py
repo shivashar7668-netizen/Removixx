@@ -1063,6 +1063,7 @@ PAGE = r"""<!doctype html>
   }
 
   /* Left: Lottie Scanner Stage */
+  /* Left: Lottie Scanner Stage with Blurred Media Preview */
   .lottie-scan-stage {
     position: relative;
     border-radius: 20px;
@@ -1076,8 +1077,34 @@ PAGE = r"""<!doctype html>
     box-shadow: 0 16px 36px -12px rgba(14, 165, 233, 0.12);
     min-height: 330px;
     text-align: center;
+    overflow: hidden;
+  }
+  .scan-bg-preview {
+    position: absolute;
+    inset: -12px;
+    background-size: cover;
+    background-position: center;
+    filter: blur(10px) brightness(0.96) saturate(1.1);
+    transform: scale(1.12);
+    opacity: 0;
+    transition: opacity 0.5s ease;
+    z-index: 0;
+    pointer-events: none;
+  }
+  .scan-bg-preview.has-image {
+    opacity: 0.45;
+  }
+  .scan-bg-overlay {
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(circle at center, rgba(255, 255, 255, 0.55) 0%, rgba(240, 249, 255, 0.82) 100%);
+    backdrop-filter: blur(3px);
+    z-index: 1;
+    pointer-events: none;
   }
   .scan-badge {
+    position: relative;
+    z-index: 2;
     display: inline-flex;
     align-items: center;
     gap: 6px;
@@ -1086,10 +1113,13 @@ PAGE = r"""<!doctype html>
     letter-spacing: 0.06em;
     text-transform: uppercase;
     color: #0284c7;
-    background: #e0f2fe;
+    background: rgba(224, 242, 254, 0.92);
+    backdrop-filter: blur(8px);
     padding: 5px 13px;
     border-radius: 9999px;
     margin-bottom: 8px;
+    border: 1px solid rgba(186, 230, 253, 0.7);
+    box-shadow: 0 2px 8px rgba(14, 165, 233, 0.15);
   }
   .scan-badge svg {
     width: 13px;
@@ -1099,6 +1129,8 @@ PAGE = r"""<!doctype html>
     stroke-width: 2.2;
   }
   .lottie-container {
+    position: relative;
+    z-index: 2;
     width: 250px;
     height: 140px;
     margin: 0 auto;
@@ -1112,6 +1144,8 @@ PAGE = r"""<!doctype html>
     height: 100% !important;
   }
   .stage-title {
+    position: relative;
+    z-index: 2;
     color: var(--ink);
     font-size: 16px;
     font-weight: 700;
@@ -1119,6 +1153,8 @@ PAGE = r"""<!doctype html>
     margin-bottom: 3px;
   }
   .stage-sub {
+    position: relative;
+    z-index: 2;
     color: var(--ink-muted);
     font-size: 12.5px;
     max-width: 320px;
@@ -1126,13 +1162,16 @@ PAGE = r"""<!doctype html>
     line-height: 1.4;
   }
   .scan-progress-box {
+    position: relative;
+    z-index: 2;
     width: 100%;
     max-width: 320px;
-    background: #ffffff;
-    border: 1px solid #e2e8f0;
+    background: rgba(255, 255, 255, 0.88);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(226, 232, 240, 0.95);
     border-radius: 12px;
     padding: 10px 14px;
-    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.02);
+    box-shadow: 0 4px 16px rgba(15, 23, 42, 0.06);
   }
   .scan-progress-header {
     display: flex;
@@ -2100,6 +2139,8 @@ PAGE = r"""<!doctype html>
       <div class="processing-layout">
         <!-- Lottie AI Scanner Stage -->
         <div class="lottie-scan-stage" id="lottie-scan-stage">
+          <div class="scan-bg-preview" id="scan-bg-preview"></div>
+          <div class="scan-bg-overlay"></div>
           <div class="scan-badge">
             <svg viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
             AI Frame Matrix Scanner
@@ -2530,6 +2571,11 @@ function resetUI() {
   errorBox.classList.remove('active');
   dropzone.style.display = '';
   document.getElementById('tool-tabs').style.display = 'flex';
+  const bgPreview = document.getElementById('scan-bg-preview');
+  if (bgPreview) {
+    bgPreview.style.backgroundImage = '';
+    bgPreview.classList.remove('has-image');
+  }
   if (ringPct) ringPct.textContent = '0%';
   if (playerProgressFill) playerProgressFill.style.width = '0%';
   if (stageSub) stageSub.removeAttribute('data-custom');
@@ -2622,6 +2668,40 @@ function startJob(file) {
   if (scanFileLabel) {
     const fn = file.name || 'File';
     scanFileLabel.textContent = fn.length > 24 ? fn.slice(0, 22) + '...' : fn;
+  }
+
+  const bgPreview = document.getElementById('scan-bg-preview');
+  if (bgPreview && file) {
+    if (file.type && file.type.startsWith('image/')) {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        bgPreview.style.backgroundImage = `url(${e.target.result})`;
+        bgPreview.classList.add('has-image');
+      };
+      reader.readAsDataURL(file);
+    } else if (file.type && file.type.startsWith('video/')) {
+      const v = document.createElement('video');
+      v.preload = 'metadata';
+      v.muted = true;
+      v.playsInline = true;
+      const vUrl = URL.createObjectURL(file);
+      v.src = vUrl;
+      v.onloadeddata = () => {
+        v.currentTime = 0.1;
+      };
+      v.onseeked = () => {
+        try {
+          const c = document.createElement('canvas');
+          c.width = v.videoWidth || 320;
+          c.height = v.videoHeight || 240;
+          const ctx = c.getContext('2d');
+          ctx.drawImage(v, 0, 0, c.width, c.height);
+          bgPreview.style.backgroundImage = `url(${c.toDataURL()})`;
+          bgPreview.classList.add('has-image');
+        } catch (err) {}
+        URL.revokeObjectURL(vUrl);
+      };
+    }
   }
 
   initLottie();
