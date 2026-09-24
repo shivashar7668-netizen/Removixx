@@ -73,6 +73,29 @@ UV_SITE_PACKAGES = Path.home() / "AppData" / "Roaming" / "uv" / "tools" / "remov
 if UV_SITE_PACKAGES.exists() and str(UV_SITE_PACKAGES) not in sys.path:
     sys.path.insert(0, str(UV_SITE_PACKAGES))
 
+def _ensure_ffmpeg():
+    if shutil.which("ffmpeg") is not None:
+        return
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe and os.path.isfile(exe):
+            p = Path(exe).parent
+            alias = p / "ffmpeg.exe"
+            if not alias.exists():
+                try:
+                    shutil.copyfile(exe, alias)
+                except Exception:
+                    pass
+            p_str = str(p)
+            if p_str not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = p_str + os.pathsep + os.environ.get("PATH", "")
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("Could not auto-configure ffmpeg: %s", e)
+
+_ensure_ffmpeg()
+
 # ── World-Class Hardware Acceleration Engine (GPU-First with CPU Fallback) ──
 def _patch_lama_engine():
     """Patch ONNX session loader with auto-detect: CUDA GPU -> DirectML GPU -> Multi-Core CPU."""
@@ -86,6 +109,47 @@ def _patch_lama_engine():
                 ort.preload_dlls()
             except Exception:
                 pass
+
+        class SafeInferenceSession:
+            """Wrapper around onnxruntime.InferenceSession that automatically falls back to CPU if GPU execution fails."""
+            def __init__(self, model_path, sess_options, providers, label):
+                self.model_path = model_path
+                self.sess_options = sess_options
+                self.providers = list(providers)
+                self.label = label
+                self._session = ort.InferenceSession(model_path, sess_options=sess_options, providers=providers)
+                self.is_cpu = ("CPUExecutionProvider" in providers and len(providers) == 1)
+
+            def run(self, output_names, input_feed, run_options=None):
+                try:
+                    return self._session.run(output_names, input_feed, run_options)
+                except Exception as run_err:
+                    if not self.is_cpu:
+                        import logging
+                        logging.getLogger(__name__).warning(
+                            "GPU session execution notice (%s); seamlessly falling back to CPU for %s...",
+                            run_err, self.label
+                        )
+                        self._session = ort.InferenceSession(
+                            self.model_path,
+                            sess_options=self.sess_options,
+                            providers=["CPUExecutionProvider"],
+                        )
+                        self.is_cpu = True
+                        return self._session.run(output_names, input_feed, run_options)
+                    raise
+
+            def get_inputs(self):
+                return self._session.get_inputs()
+
+            def get_outputs(self):
+                return self._session.get_outputs()
+
+            def get_providers(self):
+                return self._session.get_providers()
+
+            def __getattr__(self, name):
+                return getattr(self._session, name)
 
         def _find_hf_cached_model(repo_id, filename):
             """Find model: 1) bundled inside EXE, 2) huggingface cache."""
@@ -136,10 +200,11 @@ def _patch_lama_engine():
             if "CUDAExecutionProvider" in available:
                 try:
                     import numpy as np
-                    cuda_session = ort.InferenceSession(
+                    cuda_session = SafeInferenceSession(
                         model_path,
                         sess_options=so,
                         providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+                        label=label,
                     )
                     inp = cuda_session.get_inputs()
                     dummy = {i.name: np.zeros([1 if isinstance(d, str) else d for d in i.shape], dtype=np.float32) for i in inp}
@@ -157,10 +222,11 @@ def _patch_lama_engine():
             if session is None and "DmlExecutionProvider" in available:
                 try:
                     import numpy as np
-                    dml_session = ort.InferenceSession(
+                    dml_session = SafeInferenceSession(
                         model_path,
                         sess_options=so,
                         providers=["DmlExecutionProvider", "CPUExecutionProvider"],
+                        label=label,
                     )
                     # Warmup: verify GPU can actually execute this model's ops
                     inp = dml_session.get_inputs()
@@ -177,10 +243,11 @@ def _patch_lama_engine():
 
             # 3. Tier 3: Multi-Core CPU Fallback (Intel / AMD CPU)
             if session is None:
-                session = ort.InferenceSession(
+                session = SafeInferenceSession(
                     model_path,
                     sess_options=so,
                     providers=["CPUExecutionProvider"],
+                    label=label,
                 )
                 logging.getLogger(__name__).info(
                     "💻 [Removix Engine] Running on Multi-Core CPU: %s", label
