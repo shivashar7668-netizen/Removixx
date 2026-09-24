@@ -148,6 +148,9 @@ def build():
 
     print(f"  [+] Directory build ready at: {onedir_out}")
 
+    # Copy icon to root of onedir output so it is guaranteed present at {app}\removix.ico
+    shutil.copyfile(ROOT / "removix.ico", onedir_out / "removix.ico")
+
     # 3. Create Inno Setup Script
     print("\n[3/3] Compiling Windows Installer with Inno Setup...")
     iss_content = f"""[Setup]
@@ -164,7 +167,7 @@ DisableProgramGroupPage=yes
 OutputDir={ROOT / 'dist'}
 OutputBaseFilename=Removix-Setup-v1.0
 SetupIconFile={ROOT / 'removix.ico'}
-UninstallDisplayIcon={{app}}\\Removix.exe
+UninstallDisplayIcon={{app}}\\removix.ico
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
@@ -179,10 +182,11 @@ Name: "desktopicon"; Description: "{{cm:CreateDesktopIcon}}"; GroupDescription: 
 
 [Files]
 Source: "{onedir_out}\\*"; DestDir: "{{app}}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{ROOT / 'removix.ico'}"; DestDir: "{{app}}"; Flags: ignoreversion
 
 [Icons]
-Name: "{{autoprograms}}\\Removix"; Filename: "{{app}}\\Removix.exe"; IconFilename: "{{app}}\\removix.ico"
-Name: "{{autodesktop}}\\Removix"; Filename: "{{app}}\\Removix.exe"; IconFilename: "{{app}}\\removix.ico"; Tasks: desktopicon
+Name: "{{autoprograms}}\\Removix"; Filename: "{{app}}\\Removix.exe"; IconFilename: "{{app}}\\removix.ico"; IconIndex: 0
+Name: "{{autodesktop}}\\Removix"; Filename: "{{app}}\\Removix.exe"; IconFilename: "{{app}}\\removix.ico"; IconIndex: 0; Tasks: desktopicon
 
 [Run]
 Filename: "{{app}}\\Removix.exe"; Description: "{{cm:LaunchProgram,Removix}}"; Flags: nowait postinstall skipifsilent
