@@ -332,7 +332,7 @@ def sanitize_error_message(raw_msg: str, is_video: bool = False) -> str:
     return filtered
 
 
-def process_image_direct(job_id, in_path, out_path):
+def process_image_direct(job_id, in_path, out_path, custom_box=None, corner_mode=None):
     import cv2
     import numpy as np
     from remove_ai_watermarks.api import remove_visible_detailed
@@ -349,36 +349,95 @@ def process_image_direct(job_id, in_path, out_path):
         try:
             from remove_ai_watermarks import watermark_registry
             from remove_ai_watermarks.api import _load_visible_input, _write_visible_result
+            from remove_ai_watermarks import region_eraser
 
             loaded = _load_visible_input(in_path)
-            # Use confirmed trust level so marks are recognized even on images without EXIF/metadata
-            provenance = loaded.provenance or frozenset(watermark_registry.mark_keys())
-            report = watermark_registry.remove_auto_marks_detailed(
-                loaded.bgr,
-                sensitivity="auto",
-                provenance=provenance,
-                backend="auto",
-            )
+            h, w = loaded.bgr.shape[:2]
 
-            # If no known mark detected, fallback to relaxed Gemini sparkle check
-            if not report.labels:
-                from remove_ai_watermarks.gemini_engine import GeminiEngine
-                engine = GeminiEngine()
-                det = engine.detect_watermark(loaded.bgr, trust_provenance=True)
-                if not det.detected and getattr(det, "spatial_score", 0.0) >= 0.22:
-                    det.detected = True
-                    if not det.region:
-                        h, w = loaded.bgr.shape[:2]
-                        det.region = (w - 72, h - 72, 48, 48)
+            report = None
+            if custom_box and len(custom_box) == 4:
+                cb_x, cb_y, cb_w, cb_h = custom_box
+                cleaned = region_eraser.erase(loaded.bgr, boxes=[(cb_x, cb_y, cb_x + cb_w, cb_y + cb_h)], backend="auto")
+                class CustomReport:
+                    labels = ["Custom selected watermark"]
+                    image = cleaned
+                report = CustomReport()
+            elif corner_mode == "bottom-left":
+                bl_w = min(int(w * 0.18), 240)
+                bl_h = min(int(h * 0.09), 90)
+                margin_x = max(8, int(w * 0.012))
+                margin_y = max(8, int(h * 0.012))
+                cleaned = region_eraser.erase(loaded.bgr, boxes=[(margin_x, h - bl_h - margin_y, margin_x + bl_w, h - margin_y)], backend="auto")
+                class BLReport:
+                    labels = ["Bottom-Left watermark"]
+                    image = cleaned
+                report = BLReport()
+            elif corner_mode == "bottom-right":
+                br_w = min(int(w * 0.18), 240)
+                br_h = min(int(h * 0.09), 90)
+                margin_x = max(8, int(w * 0.012))
+                margin_y = max(8, int(h * 0.012))
+                cleaned = region_eraser.erase(loaded.bgr, boxes=[(w - br_w - margin_x, h - br_h - margin_y, w - margin_x, h - margin_y)], backend="auto")
+                class BRReport:
+                    labels = ["Bottom-Right watermark"]
+                    image = cleaned
+                report = BRReport()
+            else:
+                # Use confirmed trust level so marks are recognized even on images without EXIF/metadata
+                provenance = loaded.provenance or frozenset(watermark_registry.mark_keys())
+                report = watermark_registry.remove_auto_marks_detailed(
+                    loaded.bgr,
+                    sensitivity="auto",
+                    provenance=provenance,
+                    backend="auto",
+                )
 
-                if det.detected:
-                    from remove_ai_watermarks import region_eraser
-                    rx, ry, rw, rh = det.region
-                    cleaned = region_eraser.erase(loaded.bgr, boxes=[(rx, ry, rx + rw, ry + rh)], backend="auto")
-                    class FallbackReport:
-                        labels = ["Google Gemini visible watermark (sparkle)"]
+                # Relaxed Gemini sparkle check
+                if not report.labels:
+                    from remove_ai_watermarks.gemini_engine import GeminiEngine
+                    engine = GeminiEngine()
+                    det = engine.detect_watermark(loaded.bgr, trust_provenance=True)
+                    if not det.detected and getattr(det, "spatial_score", 0.0) >= 0.20:
+                        det.detected = True
+                        if not det.region:
+                            det.region = (w - 72, h - 72, 48, 48)
+
+                    if det.detected:
+                        rx, ry, rw, rh = det.region
+                        cleaned = region_eraser.erase(loaded.bgr, boxes=[(rx, ry, rx + rw, ry + rh)], backend="auto")
+                        class FallbackReport:
+                            labels = ["Google Gemini visible watermark (sparkle)"]
+                            image = cleaned
+                        report = FallbackReport()
+
+                # If still no mark detected, perform Universal AI Watermark Corner Inpaint
+                if not report.labels:
+                    from remove_ai_watermarks.gemini_engine import GeminiEngine
+                    engine = GeminiEngine()
+                    sparkle_mask = engine.footprint_mask(loaded.bgr, force=True)
+                    cleaned = None
+
+                    # If official Gemini sparkle mask builds, try erasing with LaMa
+                    if sparkle_mask is not None and sparkle_mask.any():
+                        try:
+                            cleaned = region_eraser.erase_lama(loaded.bgr, sparkle_mask)
+                        except Exception:
+                            cleaned = None
+
+                    # Fallback to standard bottom-right AI watermark box
+                    if cleaned is None:
+                        br_w = min(int(w * 0.18), 240)
+                        br_h = min(int(h * 0.09), 90)
+                        margin_x = max(8, int(w * 0.012))
+                        margin_y = max(8, int(h * 0.012))
+                        rx = w - br_w - margin_x
+                        ry = h - br_h - margin_y
+                        cleaned = region_eraser.erase(loaded.bgr, boxes=[(rx, ry, rx + br_w, ry + br_h)], backend="auto")
+
+                    class UniversalReport:
+                        labels = ["AI Watermark (Universal Clean)"]
                         image = cleaned
-                    report = FallbackReport()
+                    report = UniversalReport()
 
             _write_visible_result(
                 loaded,
@@ -415,7 +474,7 @@ def process_image_direct(job_id, in_path, out_path):
     set_job(job_id, stage="done", percent=100, message="Restoration complete")
 
 
-def process_video_direct(job_id, in_path, out_path):
+def process_video_direct(job_id, in_path, out_path, custom_box=None, corner_mode=None):
     import cv2
     from remove_ai_watermarks.video import (
         VIDEO_VISIBLE_MARKS,
@@ -504,13 +563,43 @@ def process_video_direct(job_id, in_path, out_path):
     }
 
     set_job(job_id, stage="scanning", percent=25, message="Analyzing watermark recurrence & stability...")
-    selected = _select_stable_visible_mark(scans, detected_metadata, VIDEO_VISIBLE_MARKS)
 
-    if selected is None:
-        set_job(job_id, stage="finalizing", percent=90, message="Stripping AI metadata & preserving streams...")
-        strip_and_verify(source_path, output_path, keep_standard=True)
-        set_job(job_id, stage="done", percent=100, message="Restoration complete")
-        return
+    selected = None
+    if custom_box and len(custom_box) == 4:
+        cb_x, cb_y, cb_w, cb_h = custom_box
+        regions = [(cb_x, cb_y, cb_w, cb_h)] * total_frames
+        scan = VideoScan(width, height, fps, (), shared_timestamps)
+        selected = ("custom_box", scan, regions, 0.04, "box")
+    elif corner_mode == "bottom-left":
+        wm_w = max(160, min(int(width * 0.20), 320))
+        wm_h = max(50, min(int(height * 0.085), 110))
+        margin_x = max(10, int(width * 0.015))
+        margin_y = max(10, int(height * 0.015))
+        regions = [(margin_x, height - wm_h - margin_y, wm_w, wm_h)] * total_frames
+        scan = VideoScan(width, height, fps, (), shared_timestamps)
+        selected = ("bottom_left", scan, regions, 0.04, "box")
+    elif corner_mode == "bottom-right":
+        wm_w = max(160, min(int(width * 0.20), 320))
+        wm_h = max(50, min(int(height * 0.085), 110))
+        margin_x = max(10, int(width * 0.015))
+        margin_y = max(10, int(height * 0.015))
+        regions = [(width - wm_w - margin_x, height - wm_h - margin_y, wm_w, wm_h)] * total_frames
+        scan = VideoScan(width, height, fps, (), shared_timestamps)
+        selected = ("bottom_right", scan, regions, 0.04, "box")
+    else:
+        # Auto mode: check registered detectors first
+        selected = _select_stable_visible_mark(scans, detected_metadata, VIDEO_VISIBLE_MARKS)
+        if selected is None:
+            # ── Universal AI Video Watermark Fallback (Runway, Luma, Pika, Kling, etc.) ──
+            wm_w = max(160, min(int(width * 0.20), 320))
+            wm_h = max(50, min(int(height * 0.085), 110))
+            margin_x = max(10, int(width * 0.015))
+            margin_y = max(10, int(height * 0.015))
+            box_x = width - wm_w - margin_x
+            box_y = height - wm_h - margin_y
+            regions = [(box_x, box_y, wm_w, wm_h)] * total_frames
+            scan = VideoScan(width, height, fps, (), shared_timestamps)
+            selected = ("universal_ai_corner", scan, regions, 0.04, "box")
 
     mark, scan, regions, padding_fraction, mask_style = selected
     resolved_backend = resolve_backend("lama")
@@ -679,12 +768,12 @@ def run_job_cli_fallback(job_id, in_path, out_path, ext):
     set_job(job_id, stage="done", percent=100, message="Restoration complete")
 
 
-def run_job(job_id, in_path, out_path, ext):
+def run_job(job_id, in_path, out_path, ext, custom_box=None, corner_mode=None):
     set_job(job_id, stage="scanning", percent=5, message="Scanning media and analyzing coordinates...")
     try:
         if ext in VIDEO_EXTS:
             try:
-                process_video_direct(job_id, in_path, out_path)
+                process_video_direct(job_id, in_path, out_path, custom_box=custom_box, corner_mode=corner_mode)
             except Exception as direct_err:
                 import logging
                 logging.getLogger(__name__).warning("Direct video processing failed: %s, trying CLI fallback", direct_err)
@@ -694,7 +783,7 @@ def run_job(job_id, in_path, out_path, ext):
                     raise direct_err  # Re-raise original error if CLI also missing
         elif ext in IMAGE_EXTS:
             try:
-                process_image_direct(job_id, in_path, out_path)
+                process_image_direct(job_id, in_path, out_path, custom_box=custom_box, corner_mode=corner_mode)
             except Exception as direct_err:
                 import logging
                 logging.getLogger(__name__).warning("Direct image processing failed: %s, trying CLI fallback", direct_err)
@@ -765,6 +854,19 @@ def upload():
     out_path = job_dir / f"clean{ext}"
     f.save(in_path)
 
+    # Optional custom box coordinates from request (e.g. "x,y,w,h")
+    custom_box = None
+    box_str = request.form.get("box", "").strip()
+    if box_str:
+        try:
+            parts = [int(float(p.strip())) for p in box_str.split(",")]
+            if len(parts) == 4:
+                custom_box = parts
+        except Exception:
+            pass
+
+    corner_mode = request.form.get("corner", "auto").strip().lower()
+
     with JOBS_LOCK:
         JOBS[job_id] = {
             "stage": "queued",
@@ -776,7 +878,11 @@ def upload():
             "created": time.time(),
         }
 
-    thread = threading.Thread(target=run_job, args=(job_id, in_path, out_path, ext), daemon=True)
+    thread = threading.Thread(
+        target=run_job,
+        args=(job_id, in_path, out_path, ext, custom_box, corner_mode),
+        daemon=True,
+    )
     thread.start()
 
     return jsonify({"job_id": job_id})
@@ -1141,6 +1247,44 @@ PAGE = r"""<!doctype html>
   }
   .tool-tab:hover:not(.active) {
     background: #e2e8f0;
+  }
+
+  /* Watermark Detection Zone Pills */
+  .zone-pills-bar {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    margin: 0 auto 20px;
+    flex-wrap: wrap;
+  }
+  .zone-label {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ink-muted);
+  }
+  .zone-pill {
+    background: #f1f5f9;
+    border: 1px solid var(--line);
+    color: var(--ink-muted);
+    font-size: 12px;
+    font-weight: 600;
+    padding: 6px 14px;
+    border-radius: 9999px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    outline: none;
+    font-family: inherit;
+  }
+  .zone-pill:hover {
+    background: #e2e8f0;
+    color: var(--ink);
+  }
+  .zone-pill.active {
+    background: #0284c7;
+    color: #ffffff;
+    border-color: #0284c7;
+    box-shadow: 0 2px 8px rgba(2, 132, 199, 0.25);
   }
 
   /* Dropzone */
@@ -2485,6 +2629,14 @@ PAGE = r"""<!doctype html>
       </button>
     </div>
 
+    <!-- Watermark Target Zone Selector -->
+    <div class="zone-pills-bar" id="zone-pills-bar">
+      <span class="zone-label">Target Area:</span>
+      <button type="button" class="zone-pill active" id="pill-auto" onclick="setZone('auto')">Auto AI Detect (All Tools)</button>
+      <button type="button" class="zone-pill" id="pill-br" onclick="setZone('bottom-right')">Bottom-Right Corner</button>
+      <button type="button" class="zone-pill" id="pill-bl" onclick="setZone('bottom-left')">Bottom-Left Corner</button>
+    </div>
+
     <!-- Dropzone View (3D Floating Folder Animation by 3bdel3ziz-T) -->
     <div id="dropzone" tabindex="0">
       <div class="folder-container">
@@ -2824,11 +2976,20 @@ const dlLabel = document.getElementById('dl-label');
 const resetBtn = document.getElementById('reset-btn');
 
 let currentMode = 'video';
+let currentZone = 'auto';
 let pollTimer = null;
 let lottieAnim = null;
 let currentDownloadUrl = '';
 let currentDownloadFilename = '';
 let isDownloadComplete = false;
+
+function setZone(zone) {
+  currentZone = zone;
+  document.querySelectorAll('.zone-pill').forEach(p => p.classList.remove('active'));
+  const idMap = { 'auto': 'pill-auto', 'bottom-right': 'pill-br', 'bottom-left': 'pill-bl' };
+  const btn = document.getElementById(idMap[zone]);
+  if (btn) btn.classList.add('active');
+}
 
 function triggerDownload() {
   if (!currentDownloadUrl) return;
@@ -2941,6 +3102,9 @@ function resetUI() {
   errorBox.classList.remove('active');
   dropzone.style.display = '';
   document.getElementById('tool-tabs').style.display = 'flex';
+  const zoneBar = document.getElementById('zone-pills-bar');
+  if (zoneBar) zoneBar.style.display = 'flex';
+  setZone('auto');
   const bgPreview = document.getElementById('scan-bg-preview');
   if (bgPreview) {
     bgPreview.style.backgroundImage = '';
@@ -3031,6 +3195,8 @@ function setStage(stage) {
 function startJob(file) {
   dropzone.style.display = 'none';
   document.getElementById('tool-tabs').style.display = 'none';
+  const zoneBar = document.getElementById('zone-pills-bar');
+  if (zoneBar) zoneBar.style.display = 'none';
   processingEl.classList.add('active');
   errorBox.classList.remove('active');
   resultEl.classList.remove('active');
@@ -3083,6 +3249,7 @@ function startJob(file) {
 
   const fd = new FormData();
   fd.append('file', file);
+  fd.append('corner', currentZone);
 
   fetch('/api/upload', { method: 'POST', body: fd })
     .then(r => r.json().then(j => ({ ok: r.ok, body: j })))
