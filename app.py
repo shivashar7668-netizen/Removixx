@@ -1086,8 +1086,10 @@ PAGE = r"""<!doctype html>
     max-width: 380px;
     margin: 0 auto;
     box-sizing: border-box;
-    border-radius: 20px;
-    background: linear-gradient(180deg, #f0f9ff 0%, #ffffff 100%);
+    border-radius: 24px;
+    background: rgba(255, 255, 255, 0.15);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
     border: 1.5px solid #bae6fd;
     padding: 24px 16px;
     display: flex;
@@ -1112,13 +1114,14 @@ PAGE = r"""<!doctype html>
     pointer-events: none;
   }
   .scan-bg-preview.has-image {
-    opacity: 0.45;
+    opacity: 0.6;
   }
   .scan-bg-overlay {
     position: absolute;
     inset: 0;
-    background: radial-gradient(circle at center, rgba(255, 255, 255, 0.55) 0%, rgba(240, 249, 255, 0.82) 100%);
-    backdrop-filter: blur(3px);
+    background: rgba(255, 255, 255, 0.15);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
     z-index: 1;
     pointer-events: none;
   }
