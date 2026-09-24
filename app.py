@@ -77,7 +77,12 @@ def _patch_lama_engine():
                 pass
 
         def _find_hf_cached_model(repo_id, filename):
-            """Find model in huggingface cache without importing huggingface_hub."""
+            """Find model: 1) bundled inside EXE, 2) huggingface cache."""
+            # Priority 1: Bundled inside the EXE (models/ directory)
+            bundled = BUNDLE_DIR / "models" / filename
+            if bundled.exists():
+                return str(bundled)
+            # Priority 2: Huggingface cache on disk
             cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
             model_dir = cache_dir / f"models--{repo_id.replace('/', '--')}"
             if model_dir.exists():

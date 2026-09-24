@@ -23,6 +23,14 @@ def build():
     import shutil
     shutil.rmtree(ROOT / "build", ignore_errors=True)
     
+    # Find the LaMa ONNX model in huggingface cache and bundle it
+    hf_cache = Path.home() / ".cache" / "huggingface" / "hub" / "models--Carve--LaMa-ONNX"
+    lama_model = None
+    if hf_cache.exists():
+        for f in hf_cache.rglob("lama_fp32.onnx"):
+            lama_model = f
+            break
+    
     datas = [
         f"{ROOT / 'src'};src",
         f"{ROOT / 'before.webp'};.",
@@ -33,6 +41,12 @@ def build():
         f"{ROOT / 'lottie.min.js'};.",
         f"{ROOT / 'lottie_scan.json'};.",
     ]
+    
+    if lama_model:
+        datas.append(f"{lama_model};models")
+        print(f"  [+] Bundling LaMa AI Model: {lama_model.stat().st_size / 1024 / 1024:.1f} MB")
+    else:
+        print("  [!] WARNING: LaMa model not found in cache! EXE will need internet on first run.")
     
     cmd = [
         sys.executable,
