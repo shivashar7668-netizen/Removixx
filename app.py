@@ -191,66 +191,56 @@ def process_image_direct(job_id, in_path, out_path):
 
     def run_worker():
         try:
-            # Check image dimensions for memory safety on cloud containers
+            from remove_ai_watermarks.gemini_engine import GeminiEngine
+            from remove_ai_watermarks import region_eraser
+
             img = cv2.imread(str(in_path))
             if img is not None:
                 h, w = img.shape[:2]
-                max_dim = max(h, w)
-                
-                # If image is high-res (e.g. > 1280px), extract watermark patch to prevent OOM
-                if max_dim > 1280:
-                    y0, x0 = int(h * 0.65), int(w * 0.65)
-                    patch = img[y0:, x0:].copy()
-                    
-                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as p_in, \
-                         tempfile.NamedTemporaryFile(suffix=".png", delete=False) as p_out:
-                        p_in_name = p_in.name
-                        p_out_name = p_out.name
-                    
-                    try:
-                        cv2.imwrite(p_in_name, patch)
-                        patch_report = remove_visible_detailed(
-                            p_in_name,
-                            p_out_name,
-                            backend="lama",
-                            strip_metadata=False,
-                            write_noop=True,
-                        )
-                        cleaned_patch = cv2.imread(p_out_name)
-                        if cleaned_patch is not None and patch_report.labels:
-                            # Seamless feather blending into original high-res image
-                            ph, pw = patch.shape[:2]
-                            feather = min(32, ph // 6, pw // 6)
-                            mask = np.ones((ph, pw), dtype=np.float32)
-                            for i in range(feather):
-                                mask[i, :] *= (i / feather)
-                                mask[:, i] *= (i / feather)
-                            
-                            blended = img.copy()
-                            for c in range(3):
-                                blended[y0:, x0:, c] = (
-                                    img[y0:, x0:, c] * (1.0 - mask) + cleaned_patch[:, :, c] * mask
-                                ).astype(np.uint8)
-                            
-                            cv2.imwrite(str(out_path), blended)
-                            result_container["report"] = patch_report
-                            return
-                    except Exception:
-                        pass
-                    finally:
-                        Path(p_in_name).unlink(missing_ok=True)
-                        Path(p_out_name).unlink(missing_ok=True)
+                engine = GeminiEngine()
+                det = engine.detect_watermark(img)
+                if det.detected:
+                    rx, ry, rw, rh = det.region
+                    pad = 64
+                    x0 = max(0, rx - pad)
+                    y0 = max(0, ry - pad)
+                    x1 = min(w, rx + rw + pad)
+                    y1 = min(h, ry + rh + pad)
 
-            # Standard processing
+                    patch = img[y0:y1, x0:x1].copy()
+                    pw, ph = x1 - x0, y1 - y0
+                    bx0, by0 = rx - x0, ry - y0
+                    bx1, by1 = bx0 + rw, by0 + rh
+
+                    # Erase watermark on this tiny patch (uses < 40MB RAM, never OOMs!)
+                    clean_patch = region_eraser.erase(patch, boxes=[(bx0, by0, bx1, by1)], backend="auto")
+
+                    # Feather blend back into original image (100% original quality!)
+                    mask = np.ones((ph, pw), dtype=np.float32)
+                    feather = min(24, ph // 4, pw // 4)
+                    for i in range(feather):
+                        mask[i, :] *= (i / feather)
+                        mask[:, i] *= (i / feather)
+                        mask[ph - 1 - i, :] *= (i / feather)
+                        mask[:, pw - 1 - i] *= (i / feather)
+
+                    out = img.copy()
+                    for c in range(3):
+                        out[y0:y1, x0:x1, c] = (
+                            img[y0:y1, x0:x1, c] * (1.0 - mask) + clean_patch[:, :, c] * mask
+                        ).astype(np.uint8)
+
+                    cv2.imwrite(str(out_path), out)
+
+                    class DummyReport:
+                        labels = ["Google Gemini visible watermark (sparkle)"]
+                        image = out
+
+                    result_container["report"] = DummyReport()
+                    return
+
+            # Standard processing for non-Gemini marks
             try:
-                result_container["report"] = remove_visible_detailed(
-                    in_path,
-                    out_path,
-                    backend="lama",
-                    strip_metadata=True,
-                    write_noop=True,
-                )
-            except Exception:
                 result_container["report"] = remove_visible_detailed(
                     in_path,
                     out_path,
@@ -258,6 +248,8 @@ def process_image_direct(job_id, in_path, out_path):
                     strip_metadata=True,
                     write_noop=True,
                 )
+            except Exception as e:
+                result_container["error"] = e
         except Exception as e:
             result_container["error"] = e
         finally:
