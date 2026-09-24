@@ -1853,6 +1853,7 @@ PAGE = r"""<!doctype html>
     position: relative;
     width: 100%;
     margin: 0 auto;
+    padding: 0;
     border-radius: 18px;
     overflow: hidden;
     box-shadow: 0 16px 38px -8px rgba(15, 23, 42, 0.18), 0 0 0 1px rgba(226, 232, 240, 0.9);
@@ -1866,7 +1867,8 @@ PAGE = r"""<!doctype html>
     max-width: 100%;
     aspect-ratio: 1856 / 2304;
     padding: 0;
-    margin: 0;
+    margin: 0 auto;
+    overflow: hidden;
     background: transparent !important;
   }
   #user-split-slider {
@@ -1874,6 +1876,7 @@ PAGE = r"""<!doctype html>
     max-width: 620px;
     padding: 0;
     margin: 0 auto;
+    overflow: hidden;
     background: transparent !important;
   }
   .split-layer {
@@ -1886,12 +1889,15 @@ PAGE = r"""<!doctype html>
     margin: 0;
     background: transparent !important;
   }
+  .split-slider-container img,
+  .split-layer img,
   .split-img {
     position: absolute;
     inset: 0;
-    width: 100%;
-    height: 100%;
+    width: 100% !important;
+    height: 100% !important;
     object-fit: cover !important;
+    object-position: center !important;
     display: block;
     pointer-events: none;
     background: transparent !important;
