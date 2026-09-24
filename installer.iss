@@ -12,7 +12,7 @@ DisableProgramGroupPage=yes
 OutputDir=C:\Users\Production\Documents\Removix\Removix\dist
 OutputBaseFilename=Removix-Setup-v1.0
 SetupIconFile=C:\Users\Production\Documents\Removix\Removix\removix.ico
-UninstallDisplayIcon={app}\Removix.exe
+UninstallDisplayIcon={app}\removix.ico
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
@@ -27,10 +27,11 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "C:\Users\Production\Documents\Removix\Removix\dist\Removix\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "C:\Users\Production\Documents\Removix\Removix\removix.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\Removix"; Filename: "{app}\Removix.exe"; IconFilename: "{app}\removix.ico"
-Name: "{autodesktop}\Removix"; Filename: "{app}\Removix.exe"; IconFilename: "{app}\removix.ico"; Tasks: desktopicon
+Name: "{autoprograms}\Removix"; Filename: "{app}\Removix.exe"; IconFilename: "{app}\removix.ico"; IconIndex: 0
+Name: "{autodesktop}\Removix"; Filename: "{app}\Removix.exe"; IconFilename: "{app}\removix.ico"; IconIndex: 0; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\Removix.exe"; Description: "{cm:LaunchProgram,Removix}"; Flags: nowait postinstall skipifsilent
