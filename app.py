@@ -76,13 +76,36 @@ def _patch_lama_engine():
             except Exception:
                 pass
 
+        def _find_hf_cached_model(repo_id, filename):
+            """Find model in huggingface cache without importing huggingface_hub."""
+            cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
+            model_dir = cache_dir / f"models--{repo_id.replace('/', '--')}"
+            if model_dir.exists():
+                snapshots = model_dir / "snapshots"
+                if snapshots.exists():
+                    for snap in sorted(snapshots.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+                        candidate = snap / filename
+                        if candidate.exists():
+                            return str(candidate)
+            return None
+
         def _get_session_auto(name, repo_id, filename, label):
             cached = region_eraser._sessions.get(name)
             if cached is not None:
                 return cached
-            from huggingface_hub import hf_hub_download
             import logging
-            model_path = hf_hub_download(repo_id=repo_id, filename=filename)
+            # Try finding model in huggingface cache first (no import needed)
+            model_path = _find_hf_cached_model(repo_id, filename)
+            if model_path is None:
+                # Model not cached yet - must download (first-time only)
+                try:
+                    from huggingface_hub import hf_hub_download
+                    model_path = hf_hub_download(repo_id=repo_id, filename=filename)
+                except Exception as dl_err:
+                    logging.getLogger(__name__).error(
+                        "❌ Cannot find or download model %s/%s: %s", repo_id, filename, dl_err
+                    )
+                    raise
 
             so = ort.SessionOptions()
             so.enable_cpu_mem_arena = False
