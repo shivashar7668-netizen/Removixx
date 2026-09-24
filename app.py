@@ -53,6 +53,17 @@ if sys.platform == "win32":
 
     subprocess.Popen = _silent_popen
 
+# ── Logging to file (for diagnosing issues on end-user PCs) ──
+import logging
+_log_dir = Path(tempfile.gettempdir()) / "removix_logs"
+_log_dir.mkdir(exist_ok=True)
+logging.basicConfig(
+    filename=str(_log_dir / "removix.log"),
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    encoding="utf-8",
+)
+
 BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 SRC_DIR = BUNDLE_DIR / "src"
 if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
@@ -168,8 +179,9 @@ def _patch_lama_engine():
             return session
 
         region_eraser._get_session = _get_session_auto
-    except Exception:
-        pass  # Safe fallback to default library path
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error("Engine patch failed: %s", e, exc_info=True)
 
 _patch_lama_engine()
 
@@ -612,18 +624,26 @@ def run_job(job_id, in_path, out_path, ext):
         if ext in VIDEO_EXTS:
             try:
                 process_video_direct(job_id, in_path, out_path)
-            except Exception:
-                run_job_cli_fallback(job_id, in_path, out_path, ext)
+            except Exception as direct_err:
+                import logging
+                logging.getLogger(__name__).warning("Direct video processing failed: %s, trying CLI fallback", direct_err)
+                try:
+                    run_job_cli_fallback(job_id, in_path, out_path, ext)
+                except FileNotFoundError:
+                    raise direct_err  # Re-raise original error if CLI also missing
         elif ext in IMAGE_EXTS:
             try:
                 process_image_direct(job_id, in_path, out_path)
-            except Exception:
-                run_job_cli_fallback(job_id, in_path, out_path, ext)
+            except Exception as direct_err:
+                import logging
+                logging.getLogger(__name__).warning("Direct image processing failed: %s, trying CLI fallback", direct_err)
+                try:
+                    run_job_cli_fallback(job_id, in_path, out_path, ext)
+                except FileNotFoundError:
+                    raise direct_err  # Re-raise original error if CLI also missing
         else:
             set_job(job_id, stage="error", error=f"Unsupported file type: {ext}")
             return
-    except FileNotFoundError:
-        set_job(job_id, stage="error", error="Restoration engine is currently unavailable. Please check system setup.")
     except Exception as exc:
         set_job(job_id, stage="error", error=sanitize_error_message(str(exc), is_video=(ext in VIDEO_EXTS)))
 
