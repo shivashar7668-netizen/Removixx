@@ -135,33 +135,44 @@ def _patch_lama_engine():
             # 1. Tier 1: NVIDIA CUDA GPU (Ultra-Fast)
             if "CUDAExecutionProvider" in available:
                 try:
-                    session = ort.InferenceSession(
+                    import numpy as np
+                    cuda_session = ort.InferenceSession(
                         model_path,
                         sess_options=so,
                         providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
                     )
+                    inp = cuda_session.get_inputs()
+                    dummy = {i.name: np.zeros([1 if isinstance(d, str) else d for d in i.shape], dtype=np.float32) for i in inp}
+                    cuda_session.run(None, dummy)
+                    session = cuda_session
                     logging.getLogger(__name__).info(
                         "🚀 [Removix Engine] Accelerated with NVIDIA CUDA GPU: %s", label
                     )
                 except Exception as gpu_err:
                     logging.getLogger(__name__).warning(
-                        "CUDA initialization notice (%s); trying DirectML/CPU", gpu_err
+                        "CUDA GPU incompatible (%s); trying DirectML/CPU", gpu_err
                     )
 
             # 2. Tier 2: DirectML GPU (Works on Intel Iris, AMD Radeon, NVIDIA)
             if session is None and "DmlExecutionProvider" in available:
                 try:
-                    session = ort.InferenceSession(
+                    import numpy as np
+                    dml_session = ort.InferenceSession(
                         model_path,
                         sess_options=so,
                         providers=["DmlExecutionProvider", "CPUExecutionProvider"],
                     )
+                    # Warmup: verify GPU can actually execute this model's ops
+                    inp = dml_session.get_inputs()
+                    dummy = {i.name: np.zeros([1 if isinstance(d, str) else d for d in i.shape], dtype=np.float32) for i in inp}
+                    dml_session.run(None, dummy)
+                    session = dml_session
                     logging.getLogger(__name__).info(
                         "⚡ [Removix Engine] Accelerated with DirectML GPU: %s", label
                     )
                 except Exception as dml_err:
                     logging.getLogger(__name__).warning(
-                        "DirectML initialization notice (%s); trying CPU", dml_err
+                        "DirectML GPU incompatible (%s); using CPU instead", dml_err
                     )
 
             # 3. Tier 3: Multi-Core CPU Fallback (Intel / AMD CPU)
