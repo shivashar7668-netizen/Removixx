@@ -29,7 +29,19 @@ from pathlib import Path
 
 from flask import Flask, request, jsonify, send_file, abort, Response
 
-SRC_DIR = Path(__file__).resolve().parent / "src"
+if sys.stdout is None:
+    try:
+        sys.stdout = open(os.devnull, "w")
+    except Exception:
+        pass
+if sys.stderr is None:
+    try:
+        sys.stderr = open(os.devnull, "w")
+    except Exception:
+        pass
+
+BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+SRC_DIR = BUNDLE_DIR / "src"
 if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
@@ -37,9 +49,9 @@ UV_SITE_PACKAGES = Path.home() / "AppData" / "Roaming" / "uv" / "tools" / "remov
 if UV_SITE_PACKAGES.exists() and str(UV_SITE_PACKAGES) not in sys.path:
     sys.path.insert(0, str(UV_SITE_PACKAGES))
 
-# ── GPU-accelerated LaMa with Auto-Fallback & Multi-threading ──
+# ── World-Class Hardware Acceleration Engine (GPU-First with CPU Fallback) ──
 def _patch_lama_engine():
-    """Patch ONNX session loader to auto-detect GPU/CPU with optimized settings."""
+    """Patch ONNX session loader with auto-detect: CUDA GPU -> DirectML GPU -> Multi-Core CPU."""
     try:
         from remove_ai_watermarks import region_eraser
         import onnxruntime as ort
@@ -50,8 +62,6 @@ def _patch_lama_engine():
                 ort.preload_dlls()
             except Exception:
                 pass
-
-        _original_get_session = region_eraser._get_session
 
         def _get_session_auto(name, repo_id, filename, label):
             cached = region_eraser._sessions.get(name)
@@ -65,12 +75,12 @@ def _patch_lama_engine():
             so.enable_cpu_mem_arena = False
             so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
             so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            so.intra_op_num_threads = min(os.cpu_count() or 1, 2)
+            so.intra_op_num_threads = max(1, min(os.cpu_count() or 1, 4))
 
             available = ort.get_available_providers()
             session = None
 
-            # 1. If CUDA is available, try GPU with CPU fallback
+            # 1. Tier 1: NVIDIA CUDA GPU (Ultra-Fast)
             if "CUDAExecutionProvider" in available:
                 try:
                     session = ort.InferenceSession(
@@ -79,15 +89,30 @@ def _patch_lama_engine():
                         providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
                     )
                     logging.getLogger(__name__).info(
-                        "Loaded %s model on GPU: %s (providers: %s)",
-                        label, model_path, session.get_providers()
+                        "🚀 [Removix Engine] Accelerated with NVIDIA CUDA GPU: %s", label
                     )
                 except Exception as gpu_err:
                     logging.getLogger(__name__).warning(
-                        "GPU initialization failed (%s); falling back to CPU", gpu_err
+                        "CUDA initialization notice (%s); trying DirectML/CPU", gpu_err
                     )
 
-            # 2. Fallback to CPU with low memory
+            # 2. Tier 2: DirectML GPU (Works on Intel Iris, AMD Radeon, NVIDIA)
+            if session is None and "DmlExecutionProvider" in available:
+                try:
+                    session = ort.InferenceSession(
+                        model_path,
+                        sess_options=so,
+                        providers=["DmlExecutionProvider", "CPUExecutionProvider"],
+                    )
+                    logging.getLogger(__name__).info(
+                        "⚡ [Removix Engine] Accelerated with DirectML GPU: %s", label
+                    )
+                except Exception as dml_err:
+                    logging.getLogger(__name__).warning(
+                        "DirectML initialization notice (%s); trying CPU", dml_err
+                    )
+
+            # 3. Tier 3: Multi-Core CPU Fallback (Intel / AMD CPU)
             if session is None:
                 session = ort.InferenceSession(
                     model_path,
@@ -95,7 +120,7 @@ def _patch_lama_engine():
                     providers=["CPUExecutionProvider"],
                 )
                 logging.getLogger(__name__).info(
-                    "Loaded %s model on CPU: %s", label, model_path
+                    "💻 [Removix Engine] Running on Multi-Core CPU: %s", label
                 )
 
             region_eraser._sessions[name] = session
@@ -727,10 +752,10 @@ def download(job_id):
     return send_file(job["out_path"], as_attachment=True, download_name=f"removix_{job['filename']}")
 
 
-LOTTIE_FILE = Path(__file__).resolve().parent / "lottie_scan.json"
-LOTTIE_JS_FILE = Path(__file__).resolve().parent / "lottie.min.js"
-BEFORE_WEBP = Path(__file__).resolve().parent / "before.webp"
-AFTER_WEBP = Path(__file__).resolve().parent / "after.webp"
+LOTTIE_FILE = BUNDLE_DIR / "lottie_scan.json"
+LOTTIE_JS_FILE = BUNDLE_DIR / "lottie.min.js"
+BEFORE_WEBP = BUNDLE_DIR / "before.webp"
+AFTER_WEBP = BUNDLE_DIR / "after.webp"
 
 
 @app.route("/api/animation.json")
@@ -761,11 +786,24 @@ def get_after_img():
     abort(404)
 
 
-REMOVIX_LOGO_SVG = Path(__file__).parent / "removix logo.svg"
+REMOVIX_LOGO_SVG = BUNDLE_DIR / "removix logo.svg"
+REMOVIX_ICO = BUNDLE_DIR / "removix.ico"
+
+
+@app.route("/favicon.ico")
+def get_favicon_ico():
+    if REMOVIX_ICO.exists():
+        resp = send_file(REMOVIX_ICO, mimetype="image/x-icon")
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return resp
+    if REMOVIX_LOGO_SVG.exists():
+        resp = send_file(REMOVIX_LOGO_SVG, mimetype="image/svg+xml")
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return resp
+    abort(404)
 
 
 @app.route("/static/removix-logo.svg")
-@app.route("/favicon.ico")
 @app.route("/favicon.svg")
 def get_removix_logo():
     if REMOVIX_LOGO_SVG.exists():
@@ -3027,7 +3065,56 @@ function showError(msg) {
 """
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 7860))
-    print(f"Using CLI: {CLI}")
-    print(f"Open http://localhost:{port}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    import socket
+    import urllib.request
+
+    def _find_free_port(preferred=7860):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.3)
+            if s.connect_ex(("127.0.0.1", preferred)) != 0:
+                return preferred
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+
+    port = int(os.environ.get("PORT", _find_free_port(7860)))
+    is_server_mode = os.environ.get("RENDER") is not None or "--server" in sys.argv or "--headless" in sys.argv
+
+    if is_server_mode:
+        print(f"Starting Removix Server on http://0.0.0.0:{port}...")
+        app.run(host="0.0.0.0", port=port, debug=False)
+    else:
+        # Native Desktop Application Mode (Silent native window, no browser tab, no console)
+        def _run_flask():
+            app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False)
+
+        flask_thread = threading.Thread(target=_run_flask, daemon=True)
+        flask_thread.start()
+
+        # Wait for local server to be responsive
+        for _ in range(50):
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=0.2) as resp:
+                    if resp.status == 200:
+                        break
+            except Exception:
+                time.sleep(0.06)
+
+        try:
+            import webview
+            webview.create_window(
+                title="Removix — AI Watermark Remover",
+                url=f"http://127.0.0.1:{port}",
+                width=1240,
+                height=820,
+                min_size=(960, 640),
+                background_color="#f8fafc",
+            )
+            webview.start()
+        except Exception:
+            import webbrowser
+            try:
+                webbrowser.open(f"http://127.0.0.1:{port}")
+            except Exception:
+                pass
+            flask_thread.join()
