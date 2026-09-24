@@ -1865,8 +1865,8 @@ PAGE = r"""<!doctype html>
   }
   #homepage-split-slider {
     width: 100%;
-    max-width: 100%;
-    aspect-ratio: 1684 / 2528;
+    max-width: 440px;
+    aspect-ratio: 4 / 5;
     padding: 0;
     margin: 0 auto;
     overflow: hidden;
@@ -2485,11 +2485,11 @@ PAGE = r"""<!doctype html>
     <div class="comp-visuals-wrapper">
       <div class="split-slider-container" id="homepage-split-slider">
         <div class="split-layer split-before">
-          <img src="/static/before.webp?v=5" width="1684" height="2528" alt="Original" class="split-img" loading="eager">
+          <img src="/static/before.webp?v=6" width="1684" height="2528" alt="Original" class="split-img" loading="eager">
           <span class="split-label before-label">Original</span>
         </div>
         <div class="split-layer split-after" id="homepage-split-after">
-          <img src="/static/after.webp?v=5" width="1684" height="2528" alt="After - Watermark Removed" class="split-img" loading="eager">
+          <img src="/static/after.webp?v=6" width="1684" height="2528" alt="After - Watermark Removed" class="split-img" loading="eager">
           <span class="split-label after-label">Watermark Removed</span>
         </div>
         <div class="split-handle" id="homepage-split-handle">
@@ -2726,19 +2726,21 @@ function setupSplitSlider(sliderContainerId) {
     handle.style.left = val + '%';
   }
 
-  // Adjust container aspect ratio to match natural image dimensions so no corners or watermarks are cropped
-  const img = container.querySelector('.split-before img');
-  if (img) {
-    const adjust = () => {
-      if (img.naturalWidth && img.naturalHeight) {
-        container.style.aspectRatio = `${img.naturalWidth} / ${img.naturalHeight}`;
+  // Adjust container aspect ratio to match natural image dimensions for user-uploaded images
+  if (sliderContainerId !== 'homepage-split-slider') {
+    const img = container.querySelector('.split-before img');
+    if (img) {
+      const adjust = () => {
+        if (img.naturalWidth && img.naturalHeight) {
+          container.style.aspectRatio = `${img.naturalWidth} / ${img.naturalHeight}`;
+        }
+        update();
+      };
+      if (img.complete && img.naturalWidth) {
+        adjust();
+      } else {
+        img.addEventListener('load', adjust, { once: true });
       }
-      update();
-    };
-    if (img.complete && img.naturalWidth) {
-      adjust();
-    } else {
-      img.addEventListener('load', adjust, { once: true });
     }
   }
 
