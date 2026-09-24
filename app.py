@@ -357,7 +357,7 @@ def process_image_direct(job_id, in_path, out_path, custom_box=None, corner_mode
             report = None
             if custom_box and len(custom_box) == 4:
                 cb_x, cb_y, cb_w, cb_h = custom_box
-                cleaned = region_eraser.erase(loaded.bgr, boxes=[(cb_x, cb_y, cb_x + cb_w, cb_y + cb_h)], backend="auto")
+                cleaned = region_eraser.erase(loaded.bgr, boxes=[(cb_x, cb_y, cb_w, cb_h)], backend="lama")
                 class CustomReport:
                     labels = ["Custom selected watermark"]
                     image = cleaned
@@ -367,7 +367,7 @@ def process_image_direct(job_id, in_path, out_path, custom_box=None, corner_mode
                 bl_h = min(int(h * 0.09), 90)
                 margin_x = max(8, int(w * 0.012))
                 margin_y = max(8, int(h * 0.012))
-                cleaned = region_eraser.erase(loaded.bgr, boxes=[(margin_x, h - bl_h - margin_y, margin_x + bl_w, h - margin_y)], backend="auto")
+                cleaned = region_eraser.erase(loaded.bgr, boxes=[(margin_x, h - bl_h - margin_y, bl_w, bl_h)], backend="lama")
                 class BLReport:
                     labels = ["Bottom-Left watermark"]
                     image = cleaned
@@ -377,7 +377,7 @@ def process_image_direct(job_id, in_path, out_path, custom_box=None, corner_mode
                 br_h = min(int(h * 0.09), 90)
                 margin_x = max(8, int(w * 0.012))
                 margin_y = max(8, int(h * 0.012))
-                cleaned = region_eraser.erase(loaded.bgr, boxes=[(w - br_w - margin_x, h - br_h - margin_y, w - margin_x, h - margin_y)], backend="auto")
+                cleaned = region_eraser.erase(loaded.bgr, boxes=[(w - br_w - margin_x, h - br_h - margin_y, br_w, br_h)], backend="lama")
                 class BRReport:
                     labels = ["Bottom-Right watermark"]
                     image = cleaned
@@ -389,7 +389,7 @@ def process_image_direct(job_id, in_path, out_path, custom_box=None, corner_mode
                     loaded.bgr,
                     sensitivity="auto",
                     provenance=provenance,
-                    backend="auto",
+                    backend="lama",
                 )
 
                 # Relaxed Gemini sparkle check
@@ -404,7 +404,7 @@ def process_image_direct(job_id, in_path, out_path, custom_box=None, corner_mode
 
                     if det.detected:
                         rx, ry, rw, rh = det.region
-                        cleaned = region_eraser.erase(loaded.bgr, boxes=[(rx, ry, rx + rw, ry + rh)], backend="auto")
+                        cleaned = region_eraser.erase(loaded.bgr, boxes=[(rx, ry, rw, rh)], backend="lama")
                         class FallbackReport:
                             labels = ["Google Gemini visible watermark (sparkle)"]
                             image = cleaned
@@ -432,7 +432,7 @@ def process_image_direct(job_id, in_path, out_path, custom_box=None, corner_mode
                         margin_y = max(8, int(h * 0.012))
                         rx = w - br_w - margin_x
                         ry = h - br_h - margin_y
-                        cleaned = region_eraser.erase(loaded.bgr, boxes=[(rx, ry, rx + br_w, ry + br_h)], backend="auto")
+                        cleaned = region_eraser.erase(loaded.bgr, boxes=[(rx, ry, br_w, br_h)], backend="lama")
 
                     class UniversalReport:
                         labels = ["AI Watermark (Universal Clean)"]
@@ -522,6 +522,7 @@ def process_video_direct(job_id, in_path, out_path, custom_box=None, corner_mode
         "kling": detect_kling_frame,
     }
 
+    job_dir = source_path.parent
     capture = cv2.VideoCapture(str(source_path))
     if not capture.isOpened():
         raise RuntimeError(f"Could not open video file: {source_path}")
@@ -539,12 +540,18 @@ def process_video_direct(job_id, in_path, out_path, custom_box=None, corner_mode
         ok, frame = capture.read()
         if not ok:
             break
+        if frame_index == 0:
+            try:
+                cv2.imwrite(str(job_dir / "preview_input.jpg"), frame)
+            except Exception:
+                pass
         timestamps.append(float(capture.get(cv2.CAP_PROP_POS_MSEC)) / 1000)
-        prepared = _prepare_frame(frame)
-        for mark, detector in detectors.items():
-            detections[mark].append(
-                detector(frame, frame_index=frame_index, prepared=prepared)
-            )
+        if not custom_box:
+            prepared = _prepare_frame(frame)
+            for mark, detector in detectors.items():
+                detections[mark].append(
+                    detector(frame, frame_index=frame_index, prepared=prepared)
+                )
         frame_index += 1
         pct = 5 + int(min(frame_index / total_est_frames, 1.0) * 20)
         set_job(job_id, stage="scanning", percent=pct, message=f"Scanning frame {frame_index}/{total_est_frames}...")
@@ -674,6 +681,12 @@ def process_video_direct(job_id, in_path, out_path, custom_box=None, corner_mode
                             mask,
                             copy=False,
                         )
+
+                if f_idx == 0:
+                    try:
+                        cv2.imwrite(str(job_dir / "preview_output.jpg"), frame)
+                    except Exception:
+                        pass
 
                 if timestamped_writer is None:
                     frame_pipe.write(frame.tobytes())
@@ -897,14 +910,16 @@ def status(job_id):
     ext = Path(job.get("filename", "")).suffix.lower()
     is_img = ext in IMAGE_EXTS
     is_done = job["stage"] == "done"
+    job_dir = WORKDIR / job_id
+    has_preview = is_img or (job_dir / "preview_output.jpg").exists()
     return jsonify({
         "stage": job["stage"],
         "percent": job.get("percent", 0),
         "message": job.get("message", ""),
         "error": job.get("error"),
         "is_image": is_img,
-        "input_url": f"/api/preview/{job_id}/input" if is_done and is_img else None,
-        "output_url": f"/api/preview/{job_id}/output" if is_done and is_img else None,
+        "input_url": f"/api/preview/{job_id}/input" if is_done and has_preview else None,
+        "output_url": f"/api/preview/{job_id}/output" if is_done and has_preview else None,
     })
 
 
@@ -925,6 +940,8 @@ def stream(job_id):
             ext = Path(job.get("filename", "")).suffix.lower()
             is_img = ext in IMAGE_EXTS
             is_done = stage == "done"
+            job_dir = WORKDIR / job_id
+            has_preview = is_img or (job_dir / "preview_output.jpg").exists()
 
             payload = {
                 "stage": stage,
@@ -932,8 +949,8 @@ def stream(job_id):
                 "message": message,
                 "error": error,
                 "is_image": is_img,
-                "input_url": f"/api/preview/{job_id}/input" if is_done and is_img else None,
-                "output_url": f"/api/preview/{job_id}/output" if is_done and is_img else None,
+                "input_url": f"/api/preview/{job_id}/input" if is_done and has_preview else None,
+                "output_url": f"/api/preview/{job_id}/output" if is_done and has_preview else None,
             }
             yield f"data: {json.dumps(payload)}\n\n"
 
@@ -959,8 +976,19 @@ def preview(job_id, which):
     if not job:
         abort(404)
     ext = Path(job.get("filename", "")).suffix.lower()
-    if which == "input":
-        p = WORKDIR / job_id / f"input{ext}"
+    job_dir = WORKDIR / job_id
+    if ext in VIDEO_EXTS:
+        if which == "input":
+            p = job_dir / "preview_input.jpg"
+        elif which == "output":
+            p = job_dir / "preview_output.jpg"
+        else:
+            abort(404)
+        if not p.exists():
+            abort(404)
+        return send_file(p, mimetype="image/jpeg")
+    elif which == "input":
+        p = job_dir / f"input{ext}"
     elif which == "output":
         p = Path(job["out_path"])
     else:
@@ -969,6 +997,69 @@ def preview(job_id, which):
         abort(404)
     mimetype = "image/png" if ext == ".png" else "image/jpeg" if ext in {".jpg", ".jpeg"} else "image/webp" if ext == ".webp" else None
     return send_file(p, mimetype=mimetype)
+
+
+@app.route("/api/reclean/<job_id>", methods=["POST"])
+def reclean(job_id):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if not job:
+        abort(404)
+
+    data = request.get_json(silent=True) or request.form or {}
+    box = data.get("box")
+    if isinstance(box, str):
+        try:
+            box = [int(float(v.strip())) for v in box.split(",") if v.strip()]
+        except Exception:
+            box = None
+
+    if not box or len(box) != 4:
+        return jsonify({"error": "Invalid box coordinates"}), 400
+
+    ext = Path(job.get("filename", "")).suffix.lower()
+    job_dir = WORKDIR / job_id
+    out_path = Path(job["out_path"])
+
+    if ext in IMAGE_EXTS:
+        import cv2
+        from remove_ai_watermarks import region_eraser
+
+        target_img = cv2.imread(str(out_path))
+        if target_img is None:
+            target_img = cv2.imread(str(job_dir / f"input{ext}"))
+
+        if target_img is None:
+            return jsonify({"error": "Could not read image file"}), 500
+
+        bx, by, bw, bh = box
+        cleaned = region_eraser.erase(
+            target_img,
+            boxes=[(bx, by, bw, bh)],
+            backend="lama",
+        )
+        cv2.imwrite(str(out_path), cleaned)
+        return jsonify({
+            "status": "ok",
+            "message": "Selected area erased with LaMa AI",
+            "output_url": f"/api/preview/{job_id}/output?t={time.time()}",
+        })
+    elif ext in VIDEO_EXTS:
+        in_path = job_dir / f"input{ext}"
+        with JOBS_LOCK:
+            job["stage"] = "queued"
+            job["percent"] = 0
+            job["message"] = "Re-processing video with selected watermark area..."
+
+        thread = threading.Thread(
+            target=run_job,
+            args=(job_id, in_path, out_path, ext, box, None),
+            daemon=True,
+        )
+        thread.start()
+        return jsonify({"status": "ok", "job_id": job_id})
+    else:
+        return jsonify({"error": "Unsupported file format"}), 400
 
 
 @app.route("/api/download/<job_id>")
@@ -2279,6 +2370,125 @@ PAGE = r"""<!doctype html>
     overflow: hidden;
     background: transparent !important;
   }
+
+  /* Result Mode Switcher (Compare Slider vs Box Eraser) */
+  .result-mode-bar {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 10px;
+    margin: 0 auto 16px;
+    flex-wrap: wrap;
+  }
+  .mode-btn {
+    padding: 8px 20px;
+    border-radius: 9999px;
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--ink-muted);
+    background: #f1f5f9;
+    border: 1px solid var(--line);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    transition: all 0.2s ease;
+    font-family: inherit;
+    outline: none;
+  }
+  .mode-btn:hover {
+    background: #e2e8f0;
+    color: var(--ink);
+  }
+  .mode-btn.active {
+    background: #0284c7;
+    color: #ffffff;
+    border-color: #0284c7;
+    box-shadow: 0 2px 10px rgba(2, 132, 199, 0.28);
+  }
+  .mode-btn svg {
+    width: 15px;
+    height: 15px;
+    stroke: currentColor;
+    fill: none;
+  }
+
+  /* Interactive Box Eraser Overlay */
+  .box-draw-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 30;
+    cursor: crosshair;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .box-selection-rect {
+    position: absolute;
+    border: 2px dashed #0284c7;
+    background: rgba(14, 165, 233, 0.25);
+    border-radius: 4px;
+    pointer-events: none;
+    box-shadow: 0 0 12px rgba(2, 132, 199, 0.4);
+  }
+  .box-floating-bar {
+    position: absolute;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: #0f172a;
+    color: #ffffff;
+    padding: 6px 12px;
+    border-radius: 8px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+    font-size: 12px;
+    font-weight: 600;
+    z-index: 50;
+    transform: translateY(8px);
+    white-space: nowrap;
+  }
+  .btn-box-erase {
+    background: #0284c7;
+    color: #ffffff;
+    border: none;
+    padding: 5px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 700;
+    transition: background 0.15s ease;
+    font-family: inherit;
+  }
+  .btn-box-erase:hover {
+    background: #0369a1;
+  }
+  .btn-box-cancel {
+    background: transparent;
+    color: #94a3b8;
+    border: none;
+    cursor: pointer;
+    font-size: 15px;
+    padding: 0 4px;
+    line-height: 1;
+  }
+  .btn-box-cancel:hover {
+    color: #ffffff;
+  }
+  .box-hint-badge {
+    position: absolute;
+    top: 14px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(15, 23, 42, 0.85);
+    backdrop-filter: blur(6px);
+    color: #ffffff;
+    font-size: 12.5px;
+    font-weight: 600;
+    padding: 5px 16px;
+    border-radius: 9999px;
+    pointer-events: none;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+    z-index: 40;
+  }
   .split-layer {
     position: absolute;
     inset: 0;
@@ -2720,6 +2930,18 @@ PAGE = r"""<!doctype html>
       <h3>Watermark Removed — Clean & Seamless</h3>
       <p>Smart AI reconstruction. Original texture and detail preserved.</p>
 
+      <!-- Interactive Mode Bar: Compare vs Box Eraser -->
+      <div class="result-mode-bar" id="result-mode-bar" style="display:none;">
+        <button type="button" class="mode-btn active" id="btn-mode-slider" onclick="setResultMode('slider')">
+          <svg viewBox="0 0 24 24"><path d="M8 7l-5 5 5 5M16 7l5 5-5 5"/><line x1="12" y1="3" x2="12" y2="21"/></svg>
+          Compare Slider
+        </button>
+        <button type="button" class="mode-btn" id="btn-mode-eraser" onclick="setResultMode('eraser')">
+          <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" stroke-dasharray="3 3"/><path d="M7 17l10-10"/></svg>
+          ⛶ Select & Erase Watermark
+        </button>
+      </div>
+
       <!-- Live Interactive Comparison Slider for User Upload -->
       <div class="result-slider-container" id="user-split-wrap" style="display:none;">
         <div class="split-slider-container" id="user-split-slider">
@@ -2729,7 +2951,7 @@ PAGE = r"""<!doctype html>
           </div>
           <div class="split-layer split-after" id="user-split-after">
             <img src="" id="user-img-after" alt="Cleaned image" class="split-img">
-            <span class="split-label after-label">Watermark Removed</span>
+            <span class="split-label after-label" id="after-layer-label">Watermark Removed</span>
           </div>
           <div class="split-handle" id="user-split-handle">
             <div class="split-line"></div>
@@ -2738,6 +2960,17 @@ PAGE = r"""<!doctype html>
             </div>
           </div>
           <input type="range" min="0" max="100" value="50" class="split-range" id="user-range" aria-label="Compare Original and Cleaned">
+
+          <!-- Interactive Box Eraser Overlay -->
+          <div class="box-draw-overlay" id="box-draw-overlay" style="display:none;">
+            <div class="box-selection-rect" id="box-selection-rect" style="display:none;"></div>
+            <div class="box-floating-bar" id="box-floating-bar" style="display:none;">
+              <span>Selected Area</span>
+              <button type="button" class="btn-box-erase" id="btn-box-erase" onclick="submitBoxErase()">⚡ Erase with AI</button>
+              <button type="button" class="btn-box-cancel" onclick="cancelBoxSelection()">✕</button>
+            </div>
+            <div class="box-hint-badge" id="box-hint-badge">Drag mouse over watermark to select & erase</div>
+          </div>
         </div>
       </div>
 
@@ -3125,6 +3358,11 @@ function resetUI() {
   fileInput.value = '';
   const userWrap = document.getElementById('user-split-wrap');
   if (userWrap) userWrap.style.display = 'none';
+  const modeBar = document.getElementById('result-mode-bar');
+  if (modeBar) modeBar.style.display = 'none';
+  cancelBoxSelection();
+  setResultMode('slider');
+  currentJobId = '';
   const beforeImg = document.getElementById('user-img-before');
   const afterImg = document.getElementById('user-img-after');
   if (beforeImg) beforeImg.src = '';
@@ -3141,6 +3379,7 @@ function setupSplitSlider(sliderContainerId) {
   if (!range || !afterLayer || !handle) return;
 
   function update() {
+    if (currentResultMode !== 'slider') return;
     const val = range.value;
     if (beforeLayer) {
       beforeLayer.style.clipPath = `polygon(0 0, ${val}% 0, ${val}% 100%, 0 100%)`;
@@ -3173,6 +3412,180 @@ function setupSplitSlider(sliderContainerId) {
 }
 
 setupSplitSlider('homepage-split-slider');
+
+let currentResultMode = 'slider';
+let currentJobId = '';
+let currentJobFilename = '';
+let isDrawingBox = false;
+let boxStartX = 0, boxStartY = 0;
+let activeBox = null;
+
+function setResultMode(mode) {
+  currentResultMode = mode;
+  const btnSlider = document.getElementById('btn-mode-slider');
+  const btnEraser = document.getElementById('btn-mode-eraser');
+  const overlay = document.getElementById('box-draw-overlay');
+  const userRange = document.getElementById('user-range');
+  const userHandle = document.getElementById('user-split-handle');
+  const beforeLayer = document.querySelector('#user-split-slider .split-before');
+  const afterLayer = document.querySelector('#user-split-slider .split-after');
+  const afterLabel = document.getElementById('after-layer-label');
+
+  if (mode === 'slider') {
+    if (btnSlider) btnSlider.classList.add('active');
+    if (btnEraser) btnEraser.classList.remove('active');
+    if (overlay) overlay.style.display = 'none';
+    if (userRange) userRange.style.display = 'block';
+    if (userHandle) userHandle.style.display = 'flex';
+    if (afterLabel) afterLabel.textContent = 'Watermark Removed';
+    cancelBoxSelection();
+    const val = userRange ? userRange.value : 50;
+    if (beforeLayer) beforeLayer.style.clipPath = `polygon(0 0, ${val}% 0, ${val}% 100%, 0 100%)`;
+    if (afterLayer) afterLayer.style.clipPath = `polygon(${val}% 0, 100% 0, 100% 100%, ${val}% 100%)`;
+    if (userHandle) userHandle.style.left = val + '%';
+  } else {
+    if (btnEraser) btnEraser.classList.add('active');
+    if (btnSlider) btnSlider.classList.remove('active');
+    if (userRange) userRange.style.display = 'none';
+    if (userHandle) userHandle.style.display = 'none';
+    if (beforeLayer) beforeLayer.style.clipPath = 'polygon(0 0, 0 0, 0 100%, 0 100%)';
+    if (afterLayer) afterLayer.style.clipPath = 'polygon(0 0, 100% 0, 100% 100%, 0 100%)';
+    if (afterLabel) afterLabel.textContent = 'Select Area to Erase';
+    if (overlay) overlay.style.display = 'block';
+    cancelBoxSelection();
+  }
+}
+
+function initBoxEraserEvents() {
+  const overlay = document.getElementById('box-draw-overlay');
+  const rectEl = document.getElementById('box-selection-rect');
+  const floatBar = document.getElementById('box-floating-bar');
+  if (!overlay || !rectEl || !floatBar) return;
+
+  const onDown = (e) => {
+    if (e.target.closest('#box-floating-bar')) return;
+    const r = overlay.getBoundingClientRect();
+    boxStartX = e.clientX - r.left;
+    boxStartY = e.clientY - r.top;
+    isDrawingBox = true;
+    activeBox = null;
+    floatBar.style.display = 'none';
+    rectEl.style.display = 'block';
+    rectEl.style.left = boxStartX + 'px';
+    rectEl.style.top = boxStartY + 'px';
+    rectEl.style.width = '0px';
+    rectEl.style.height = '0px';
+    try { overlay.setPointerCapture(e.pointerId); } catch(err) {}
+  };
+
+  const onMove = (e) => {
+    if (!isDrawingBox) return;
+    const r = overlay.getBoundingClientRect();
+    const curX = Math.max(0, Math.min(r.width, e.clientX - r.left));
+    const curY = Math.max(0, Math.min(r.height, e.clientY - r.top));
+    const x = Math.min(boxStartX, curX);
+    const y = Math.min(boxStartY, curY);
+    const w = Math.abs(curX - boxStartX);
+    const h = Math.abs(curY - boxStartY);
+    rectEl.style.left = x + 'px';
+    rectEl.style.top = y + 'px';
+    rectEl.style.width = w + 'px';
+    rectEl.style.height = h + 'px';
+    activeBox = { x, y, w, h };
+  };
+
+  const onUp = (e) => {
+    if (!isDrawingBox) return;
+    isDrawingBox = false;
+    try { overlay.releasePointerCapture(e.pointerId); } catch(err) {}
+    if (!activeBox || activeBox.w < 6 || activeBox.h < 6) {
+      cancelBoxSelection();
+      return;
+    }
+    floatBar.style.display = 'flex';
+    const barTop = Math.min(overlay.clientHeight - 48, activeBox.y + activeBox.h + 8);
+    const barLeft = Math.max(8, Math.min(overlay.clientWidth - 190, activeBox.x));
+    floatBar.style.top = barTop + 'px';
+    floatBar.style.left = barLeft + 'px';
+  };
+
+  overlay.addEventListener('pointerdown', onDown);
+  overlay.addEventListener('pointermove', onMove);
+  overlay.addEventListener('pointerup', onUp);
+  overlay.addEventListener('pointercancel', () => { isDrawingBox = false; cancelBoxSelection(); });
+}
+
+function cancelBoxSelection() {
+  activeBox = null;
+  const rectEl = document.getElementById('box-selection-rect');
+  const floatBar = document.getElementById('box-floating-bar');
+  if (rectEl) rectEl.style.display = 'none';
+  if (floatBar) floatBar.style.display = 'none';
+}
+
+function submitBoxErase() {
+  if (!activeBox || !currentJobId) return;
+  const afterImg = document.getElementById('user-img-after');
+  const overlay = document.getElementById('box-draw-overlay');
+  if (!afterImg || !overlay) return;
+
+  const r = overlay.getBoundingClientRect();
+  const naturalW = afterImg.naturalWidth || r.width;
+  const naturalH = afterImg.naturalHeight || r.height;
+  const scaleX = naturalW / r.width;
+  const scaleY = naturalH / r.height;
+  const imgX = Math.max(0, Math.round(activeBox.x * scaleX));
+  const imgY = Math.max(0, Math.round(activeBox.y * scaleY));
+  const imgW = Math.min(naturalW - imgX, Math.round(activeBox.w * scaleX));
+  const imgH = Math.min(naturalH - imgY, Math.round(activeBox.h * scaleY));
+
+  const eraseBtn = document.getElementById('btn-box-erase');
+  if (eraseBtn) {
+    eraseBtn.disabled = true;
+    eraseBtn.textContent = 'Erasing with AI...';
+  }
+
+  fetch('/api/reclean/' + currentJobId, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ box: [imgX, imgY, imgW, imgH] })
+  })
+  .then(res => res.json())
+  .then(data => {
+    if (eraseBtn) {
+      eraseBtn.disabled = false;
+      eraseBtn.textContent = '⚡ Erase with AI';
+    }
+    if (data.output_url) {
+      afterImg.src = data.output_url;
+      cancelBoxSelection();
+      setResultMode('slider');
+    } else if (data.job_id) {
+      cancelBoxSelection();
+      setResultMode('slider');
+      resultEl.classList.remove('active');
+      processingEl.classList.add('active');
+      setStage('scanning');
+      setProgress(5, 'Re-restoring video with selected area...');
+      poll(data.job_id, currentJobFilename || 'video');
+    } else if (data.error) {
+      alert('Could not erase: ' + data.error);
+    }
+  })
+  .catch(err => {
+    if (eraseBtn) {
+      eraseBtn.disabled = false;
+      eraseBtn.textContent = '⚡ Erase with AI';
+    }
+    alert('Error: ' + err.message);
+  });
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initBoxEraserEvents);
+} else {
+  initBoxEraserEvents();
+}
 
 function setStage(stage) {
   const idx = stageOrder.indexOf(stage);
@@ -3294,13 +3707,16 @@ function handleJob(job, jobId, filename) {
       resultEl.classList.add('active');
       currentDownloadUrl = '/api/download/' + jobId;
       currentDownloadFilename = 'removix_' + filename;
+      currentJobId = jobId;
+      currentJobFilename = filename;
       if (dlCheckbox) dlCheckbox.checked = false;
       if (dlLabel) dlLabel.classList.remove('is-checked');
       isDownloadComplete = false;
 
       // Live interactive split comparison for user upload
       const userWrap = document.getElementById('user-split-wrap');
-      if (job.is_image && job.input_url && job.output_url && userWrap) {
+      const modeBar = document.getElementById('result-mode-bar');
+      if (job.input_url && job.output_url && userWrap) {
         const beforeImg = document.getElementById('user-img-before');
         const afterImg = document.getElementById('user-img-after');
         if (beforeImg && afterImg) {
@@ -3309,10 +3725,13 @@ function handleJob(job, jobId, filename) {
           const userRange = document.getElementById('user-range');
           if (userRange) userRange.value = 50;
           userWrap.style.display = 'block';
+          if (modeBar) modeBar.style.display = 'flex';
+          setResultMode('slider');
           setupSplitSlider('user-split-slider');
         }
-      } else if (userWrap) {
-        userWrap.style.display = 'none';
+      } else {
+        if (userWrap) userWrap.style.display = 'none';
+        if (modeBar) modeBar.style.display = 'none';
       }
     }, 450);
   }
