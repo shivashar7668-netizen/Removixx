@@ -347,65 +347,48 @@ def process_image_direct(job_id, in_path, out_path):
 
     def run_worker():
         try:
-            from remove_ai_watermarks.gemini_engine import GeminiEngine
-            from remove_ai_watermarks import region_eraser
+            from remove_ai_watermarks import watermark_registry
+            from remove_ai_watermarks.api import _load_visible_input, _write_visible_result
 
-            img = cv2.imread(str(in_path))
-            if img is not None:
-                h, w = img.shape[:2]
+            loaded = _load_visible_input(in_path)
+            # Use confirmed trust level so marks are recognized even on images without EXIF/metadata
+            provenance = loaded.provenance or frozenset(watermark_registry.mark_keys())
+            report = watermark_registry.remove_auto_marks_detailed(
+                loaded.bgr,
+                sensitivity="auto",
+                provenance=provenance,
+                backend="auto",
+            )
+
+            # If no known mark detected, fallback to relaxed Gemini sparkle check
+            if not report.labels:
+                from remove_ai_watermarks.gemini_engine import GeminiEngine
                 engine = GeminiEngine()
-                det = engine.detect_watermark(img)
+                det = engine.detect_watermark(loaded.bgr, trust_provenance=True)
+                if not det.detected and getattr(det, "spatial_score", 0.0) >= 0.22:
+                    det.detected = True
+                    if not det.region:
+                        h, w = loaded.bgr.shape[:2]
+                        det.region = (w - 72, h - 72, 48, 48)
+
                 if det.detected:
+                    from remove_ai_watermarks import region_eraser
                     rx, ry, rw, rh = det.region
-                    pad = 64
-                    x0 = max(0, rx - pad)
-                    y0 = max(0, ry - pad)
-                    x1 = min(w, rx + rw + pad)
-                    y1 = min(h, ry + rh + pad)
-
-                    patch = img[y0:y1, x0:x1].copy()
-                    pw, ph = x1 - x0, y1 - y0
-                    bx0, by0 = rx - x0, ry - y0
-                    bx1, by1 = bx0 + rw, by0 + rh
-
-                    # Erase watermark on this tiny patch (uses < 40MB RAM, never OOMs!)
-                    clean_patch = region_eraser.erase(patch, boxes=[(bx0, by0, bx1, by1)], backend="auto")
-
-                    # Feather blend back into original image (100% original quality!)
-                    mask = np.ones((ph, pw), dtype=np.float32)
-                    feather = min(24, ph // 4, pw // 4)
-                    for i in range(feather):
-                        mask[i, :] *= (i / feather)
-                        mask[:, i] *= (i / feather)
-                        mask[ph - 1 - i, :] *= (i / feather)
-                        mask[:, pw - 1 - i] *= (i / feather)
-
-                    out = img.copy()
-                    for c in range(3):
-                        out[y0:y1, x0:x1, c] = (
-                            img[y0:y1, x0:x1, c] * (1.0 - mask) + clean_patch[:, :, c] * mask
-                        ).astype(np.uint8)
-
-                    cv2.imwrite(str(out_path), out)
-
-                    class DummyReport:
+                    cleaned = region_eraser.erase(loaded.bgr, boxes=[(rx, ry, rx + rw, ry + rh)], backend="auto")
+                    class FallbackReport:
                         labels = ["Google Gemini visible watermark (sparkle)"]
-                        image = out
+                        image = cleaned
+                    report = FallbackReport()
 
-                    result_container["report"] = DummyReport()
-                    return
-
-            # Standard processing for non-Gemini marks
-            try:
-                result_container["report"] = remove_visible_detailed(
-                    in_path,
-                    out_path,
-                    backend="auto",
-                    strip_metadata=True,
-                    write_noop=True,
-                )
-            except Exception as e:
-                result_container["error"] = e
+            _write_visible_result(
+                loaded,
+                report.image,
+                report.labels,
+                out_path,
+                strip_metadata=True,
+                write_noop=True,
+            )
+            result_container["report"] = report
         except Exception as e:
             result_container["error"] = e
         finally:
