@@ -8,7 +8,10 @@ import math
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
+
+_WIN_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 from contextlib import contextmanager
 from dataclasses import dataclass
 from fractions import Fraction
@@ -187,6 +190,7 @@ def _run_ffprobe(
         capture_output=True,
         check=False,
         text=True,
+        creationflags=_WIN_NO_WINDOW,
     )
     log.info(
         "ffprobe %s: command=%s status=%s stdout=%s stderr=%s",
@@ -433,6 +437,7 @@ def mux_encoded_video(
             stdout=subprocess.DEVNULL,
             stderr=stderr_buffer,
             check=False,
+            creationflags=_WIN_NO_WINDOW,
         )
         stderr = _read_bounded_stderr(stderr_buffer)
     log.info(
@@ -471,6 +476,7 @@ def start_raw_video_encoder(command: list[str]) -> _RawVideoEncoder:
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=stderr_buffer,
+            creationflags=_WIN_NO_WINDOW,
         )
     except Exception:
         stderr_buffer.close()

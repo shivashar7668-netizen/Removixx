@@ -24,7 +24,7 @@ def build():
         f"{ROOT / 'src'};src",
         f"{ROOT / 'before.webp'};.",
         f"{ROOT / 'after.webp'};.",
-        f"{ROOT / 'removix logo.svg'};.",
+        f"{ROOT / 'removix.png'};.",
         f"{ROOT / 'removix.ico'};.",
         f"{ROOT / 'lottie.min.js'};.",
         f"{ROOT / 'lottie_scan.json'};.",

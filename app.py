@@ -40,6 +40,19 @@ if sys.stderr is None:
     except Exception:
         pass
 
+# Suppress any child process console windows (ffmpeg, ffprobe, etc.) on Windows
+if sys.platform == "win32":
+    _orig_popen = subprocess.Popen
+
+    def _silent_popen(*args, **kwargs):
+        if "creationflags" not in kwargs:
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        else:
+            kwargs["creationflags"] |= subprocess.CREATE_NO_WINDOW
+        return _orig_popen(*args, **kwargs)
+
+    subprocess.Popen = _silent_popen
+
 BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 SRC_DIR = BUNDLE_DIR / "src"
 if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
@@ -786,7 +799,7 @@ def get_after_img():
     abort(404)
 
 
-REMOVIX_LOGO_SVG = BUNDLE_DIR / "removix logo.svg"
+REMOVIX_PNG = BUNDLE_DIR / "removix.png"
 REMOVIX_ICO = BUNDLE_DIR / "removix.ico"
 
 
@@ -796,19 +809,21 @@ def get_favicon_ico():
         resp = send_file(REMOVIX_ICO, mimetype="image/x-icon")
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return resp
-    if REMOVIX_LOGO_SVG.exists():
-        resp = send_file(REMOVIX_LOGO_SVG, mimetype="image/svg+xml")
-        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        return resp
     abort(404)
 
 
+@app.route("/static/removix.png")
+@app.route("/static/removix-logo.png")
 @app.route("/static/removix-logo.svg")
 @app.route("/favicon.svg")
+@app.route("/favicon.png")
 def get_removix_logo():
-    if REMOVIX_LOGO_SVG.exists():
-        resp = send_file(REMOVIX_LOGO_SVG, mimetype="image/svg+xml")
+    if REMOVIX_PNG.exists():
+        resp = send_file(REMOVIX_PNG, mimetype="image/png")
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return resp
+    if REMOVIX_ICO.exists():
+        resp = send_file(REMOVIX_ICO, mimetype="image/x-icon")
         return resp
     abort(404)
 
@@ -819,9 +834,9 @@ PAGE = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Removix — AI Video & Image Watermark Remover</title>
-<link rel="icon" type="image/svg+xml" href="/static/removix-logo.svg?v=2">
-<link rel="shortcut icon" href="/static/removix-logo.svg?v=2">
-<link rel="apple-touch-icon" href="/static/removix-logo.svg?v=2">
+<link rel="icon" type="image/png" href="/static/removix.png?v=3">
+<link rel="shortcut icon" href="/favicon.ico?v=3">
+<link rel="apple-touch-icon" href="/static/removix.png?v=3">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -888,13 +903,14 @@ PAGE = r"""<!doctype html>
     box-shadow: 0 4px 16px rgba(15, 23, 42, 0.04);
   }
   .brand-icon {
-    width: 25px;
-    height: 25px;
+    width: 26px;
+    height: 26px;
     display: flex;
     align-items: center;
     justify-content: center;
     overflow: hidden;
     flex-shrink: 0;
+    border-radius: 6px;
   }
   .brand-icon img, .brand-logo-img {
     width: 100%;
@@ -2313,7 +2329,7 @@ PAGE = r"""<!doctype html>
 <header class="top-header">
   <div class="brand-badge">
     <div class="brand-icon">
-      <img src="/static/removix-logo.svg?v=2" alt="Removix Logo" class="brand-logo-img">
+      <img src="/static/removix.png?v=3" alt="Removix Logo" class="brand-logo-img">
     </div>
     <span class="brand-name">emovix</span>
   </div>
