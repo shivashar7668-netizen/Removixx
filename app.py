@@ -2350,7 +2350,8 @@ PAGE = r"""<!doctype html>
     box-shadow: 0 16px 38px -8px rgba(15, 23, 42, 0.18), 0 0 0 1px rgba(226, 232, 240, 0.9);
     user-select: none;
     -webkit-user-select: none;
-    touch-action: pan-y;
+    touch-action: none;
+    cursor: ew-resize;
     background: transparent !important;
   }
   #homepage-split-slider {
@@ -2598,6 +2599,7 @@ PAGE = r"""<!doctype html>
     z-index: 10;
     margin: 0;
     padding: 0;
+    pointer-events: none;
   }
 
   /* Result-specific slider wrap */
@@ -3547,7 +3549,7 @@ function setupSplitSlider(sliderContainerId) {
 
   function update() {
     if (sliderContainerId === 'user-split-slider' && currentResultMode !== 'slider') return;
-    const val = range.value;
+    const val = parseFloat(range.value);
     if (beforeLayer) {
       beforeLayer.style.clipPath = `polygon(0 0, ${val}% 0, ${val}% 100%, 0 100%)`;
     }
@@ -3573,11 +3575,46 @@ function setupSplitSlider(sliderContainerId) {
     }
   }
 
+  function setPosFromClientX(clientX) {
+    const rect = container.getBoundingClientRect();
+    if (!rect.width) return;
+    let pct = ((clientX - rect.left) / rect.width) * 100;
+    pct = Math.max(0, Math.min(100, pct));
+    range.value = pct;
+    update();
+  }
+
   if (!container._hasSliderEvents) {
     container._hasSliderEvents = true;
+
+    let isDragging = false;
+
+    container.addEventListener('pointerdown', (e) => {
+      if (sliderContainerId === 'user-split-slider' && currentResultMode !== 'slider') return;
+      isDragging = true;
+      try { container.setPointerCapture(e.pointerId); } catch(err) {}
+      setPosFromClientX(e.clientX);
+    });
+
+    container.addEventListener('pointermove', (e) => {
+      if (!isDragging) return;
+      setPosFromClientX(e.clientX);
+    });
+
+    const stopDragging = (e) => {
+      if (isDragging) {
+        isDragging = false;
+        try { container.releasePointerCapture(e.pointerId); } catch(err) {}
+      }
+    };
+
+    container.addEventListener('pointerup', stopDragging);
+    container.addEventListener('pointercancel', stopDragging);
+
     range.addEventListener('input', update);
     range.addEventListener('change', update);
   }
+
   update();
 }
 
@@ -3763,11 +3800,8 @@ function initApp() {
   setupSplitSlider('homepage-split-slider');
 }
 
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', initApp);
-} else {
-  initApp();
-}
+initApp();
+document.addEventListener('DOMContentLoaded', initApp);
 </script>
 </body>
 </html>
