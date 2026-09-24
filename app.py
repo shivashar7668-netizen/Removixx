@@ -3210,6 +3210,12 @@ const resetBtn = document.getElementById('reset-btn');
 
 let currentMode = 'video';
 let currentZone = 'auto';
+let currentResultMode = 'slider';
+let currentJobId = '';
+let currentJobFilename = '';
+let isDrawingBox = false;
+let boxStartX = 0, boxStartY = 0;
+let activeBox = null;
 let pollTimer = null;
 let lottieAnim = null;
 let currentDownloadUrl = '';
@@ -3369,57 +3375,6 @@ function resetUI() {
   if (afterImg) afterImg.src = '';
 }
 
-function setupSplitSlider(sliderContainerId) {
-  const container = document.getElementById(sliderContainerId);
-  if (!container) return;
-  const range = container.querySelector('.split-range');
-  const beforeLayer = container.querySelector('.split-before');
-  const afterLayer = container.querySelector('.split-after');
-  const handle = container.querySelector('.split-handle');
-  if (!range || !afterLayer || !handle) return;
-
-  function update() {
-    if (currentResultMode !== 'slider') return;
-    const val = range.value;
-    if (beforeLayer) {
-      beforeLayer.style.clipPath = `polygon(0 0, ${val}% 0, ${val}% 100%, 0 100%)`;
-    }
-    afterLayer.style.clipPath = `polygon(${val}% 0, 100% 0, 100% 100%, ${val}% 100%)`;
-    handle.style.left = val + '%';
-  }
-
-  // Adjust container aspect ratio to match natural image dimensions for user-uploaded images
-  if (sliderContainerId !== 'homepage-split-slider') {
-    const img = container.querySelector('.split-before img');
-    if (img) {
-      const adjust = () => {
-        if (img.naturalWidth && img.naturalHeight) {
-          container.style.aspectRatio = `${img.naturalWidth} / ${img.naturalHeight}`;
-        }
-        update();
-      };
-      if (img.complete && img.naturalWidth) {
-        adjust();
-      } else {
-        img.addEventListener('load', adjust, { once: true });
-      }
-    }
-  }
-
-  range.addEventListener('input', update);
-  range.addEventListener('change', update);
-  update();
-}
-
-setupSplitSlider('homepage-split-slider');
-
-let currentResultMode = 'slider';
-let currentJobId = '';
-let currentJobFilename = '';
-let isDrawingBox = false;
-let boxStartX = 0, boxStartY = 0;
-let activeBox = null;
-
 function setResultMode(mode) {
   currentResultMode = mode;
   const btnSlider = document.getElementById('btn-mode-slider');
@@ -3454,6 +3409,14 @@ function setResultMode(mode) {
     if (overlay) overlay.style.display = 'block';
     cancelBoxSelection();
   }
+}
+
+function cancelBoxSelection() {
+  activeBox = null;
+  const rectEl = document.getElementById('box-selection-rect');
+  const floatBar = document.getElementById('box-floating-bar');
+  if (rectEl) rectEl.style.display = 'none';
+  if (floatBar) floatBar.style.display = 'none';
 }
 
 function initBoxEraserEvents() {
@@ -3515,14 +3478,6 @@ function initBoxEraserEvents() {
   overlay.addEventListener('pointercancel', () => { isDrawingBox = false; cancelBoxSelection(); });
 }
 
-function cancelBoxSelection() {
-  activeBox = null;
-  const rectEl = document.getElementById('box-selection-rect');
-  const floatBar = document.getElementById('box-floating-bar');
-  if (rectEl) rectEl.style.display = 'none';
-  if (floatBar) floatBar.style.display = 'none';
-}
-
 function submitBoxErase() {
   if (!activeBox || !currentJobId) return;
   const afterImg = document.getElementById('user-img-after');
@@ -3581,10 +3536,49 @@ function submitBoxErase() {
   });
 }
 
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', initBoxEraserEvents);
-} else {
-  initBoxEraserEvents();
+function setupSplitSlider(sliderContainerId) {
+  const container = document.getElementById(sliderContainerId);
+  if (!container) return;
+  const range = container.querySelector('.split-range');
+  const beforeLayer = container.querySelector('.split-before');
+  const afterLayer = container.querySelector('.split-after');
+  const handle = container.querySelector('.split-handle');
+  if (!range || !afterLayer || !handle) return;
+
+  function update() {
+    if (sliderContainerId === 'user-split-slider' && currentResultMode !== 'slider') return;
+    const val = range.value;
+    if (beforeLayer) {
+      beforeLayer.style.clipPath = `polygon(0 0, ${val}% 0, ${val}% 100%, 0 100%)`;
+    }
+    afterLayer.style.clipPath = `polygon(${val}% 0, 100% 0, 100% 100%, ${val}% 100%)`;
+    handle.style.left = val + '%';
+  }
+
+  // Adjust container aspect ratio to match natural image dimensions for user-uploaded images
+  if (sliderContainerId !== 'homepage-split-slider') {
+    const img = container.querySelector('.split-before img');
+    if (img) {
+      const adjust = () => {
+        if (img.naturalWidth && img.naturalHeight) {
+          container.style.aspectRatio = `${img.naturalWidth} / ${img.naturalHeight}`;
+        }
+        update();
+      };
+      if (img.complete && img.naturalWidth) {
+        adjust();
+      } else {
+        img.addEventListener('load', adjust, { once: true });
+      }
+    }
+  }
+
+  if (!container._hasSliderEvents) {
+    container._hasSliderEvents = true;
+    range.addEventListener('input', update);
+    range.addEventListener('change', update);
+  }
+  update();
 }
 
 function setStage(stage) {
@@ -3739,40 +3733,19 @@ function handleJob(job, jobId, filename) {
 
 function startPolling(jobId, filename) {
   if (pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(() => {
+  const checkStatus = () => {
     fetch('/api/status/' + jobId)
       .then(r => r.json())
       .then(job => handleJob(job, jobId, filename))
       .catch(() => {});
-  }, 250);
+  };
+  checkStatus();
+  pollTimer = setInterval(checkStatus, 200);
 }
 
 function poll(jobId, filename) {
   cleanupStream();
-
-  let sseStarted = false;
-  if (window.EventSource) {
-    try {
-      streamSource = new EventSource('/api/stream/' + jobId);
-      streamSource.onmessage = (e) => {
-        sseStarted = true;
-        try {
-          const job = JSON.parse(e.data);
-          handleJob(job, jobId, filename);
-        } catch (err) {}
-      };
-      streamSource.onerror = () => {
-        if (!sseStarted) {
-          cleanupStream();
-          startPolling(jobId, filename);
-        }
-      };
-    } catch (e) {
-      startPolling(jobId, filename);
-    }
-  } else {
-    startPolling(jobId, filename);
-  }
+  startPolling(jobId, filename);
 }
 
 function showError(msg) {
@@ -3782,6 +3755,18 @@ function showError(msg) {
   errorBox.classList.add('active');
   dropzone.style.display = '';
   document.getElementById('tool-tabs').style.display = 'flex';
+}
+
+function initApp() {
+  initLottie();
+  initBoxEraserEvents();
+  setupSplitSlider('homepage-split-slider');
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initApp);
+} else {
+  initApp();
 }
 </script>
 </body>
