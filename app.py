@@ -836,8 +836,11 @@ PAGE = r"""<!doctype html>
   /* ---------- Tool Card (Hero Main Box) ---------- */
   .tool-container {
     max-width: 860px;
+    width: 100%;
     margin: 0 auto;
     padding: 0 20px;
+    box-sizing: border-box;
+    overflow-x: hidden;
   }
   .main-tool-card {
     background: var(--card-bg);
@@ -847,6 +850,9 @@ PAGE = r"""<!doctype html>
     padding: 32px;
     position: relative;
     overflow: hidden;
+    overflow-x: hidden;
+    width: 100%;
+    box-sizing: border-box;
   }
 
   /* Mode Switcher tabs */
@@ -1045,6 +1051,9 @@ PAGE = r"""<!doctype html>
   /* ---------- Processing View ---------- */
   .processing {
     display: none;
+    width: 100%;
+    box-sizing: border-box;
+    overflow-x: hidden;
   }
   .processing.active {
     display: block;
@@ -1057,19 +1066,30 @@ PAGE = r"""<!doctype html>
     grid-template-columns: 1.15fr 0.85fr;
     gap: 24px;
     align-items: center;
+    width: 100%;
+    box-sizing: border-box;
+    overflow-x: hidden;
   }
   @media (max-width: 768px) {
-    .processing-layout { grid-template-columns: 1fr; }
+    .processing-layout {
+      grid-template-columns: 1fr;
+      justify-items: center;
+      gap: 20px;
+      overflow-x: hidden;
+    }
   }
 
-  /* Left: Lottie Scanner Stage */
   /* Left: Lottie Scanner Stage with Blurred Media Preview */
   .lottie-scan-stage {
     position: relative;
+    width: 90%;
+    max-width: 380px;
+    margin: 0 auto;
+    box-sizing: border-box;
     border-radius: 20px;
     background: linear-gradient(180deg, #f0f9ff 0%, #ffffff 100%);
     border: 1.5px solid #bae6fd;
-    padding: 24px 20px;
+    padding: 24px 16px;
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -1131,17 +1151,20 @@ PAGE = r"""<!doctype html>
   .lottie-container {
     position: relative;
     z-index: 2;
-    width: 250px;
+    width: 100%;
+    max-width: 250px;
     height: 140px;
     margin: 0 auto;
     display: flex;
     align-items: center;
     justify-content: center;
     overflow: hidden;
+    box-sizing: border-box;
   }
   .lottie-container svg {
     width: 100% !important;
     height: 100% !important;
+    max-width: 100%;
   }
   .stage-title {
     position: relative;
@@ -1151,6 +1174,9 @@ PAGE = r"""<!doctype html>
     font-weight: 700;
     margin-top: 6px;
     margin-bottom: 3px;
+    word-break: break-word;
+    max-width: 100%;
+    box-sizing: border-box;
   }
   .stage-sub {
     position: relative;
@@ -1158,8 +1184,11 @@ PAGE = r"""<!doctype html>
     color: var(--ink-muted);
     font-size: 12.5px;
     max-width: 320px;
+    width: 100%;
     margin: 0 auto 14px;
     line-height: 1.4;
+    word-break: break-word;
+    box-sizing: border-box;
   }
   .scan-progress-box {
     position: relative;
@@ -1172,6 +1201,7 @@ PAGE = r"""<!doctype html>
     border-radius: 12px;
     padding: 10px 14px;
     box-shadow: 0 4px 16px rgba(15, 23, 42, 0.06);
+    box-sizing: border-box;
   }
   .scan-progress-header {
     display: flex;
@@ -1288,6 +1318,66 @@ PAGE = r"""<!doctype html>
     border-color: #10b981;
     background: #10b981;
     color: #fff;
+  }
+
+  /* Mobile Responsiveness for Processing UI Box (320px - 540px) */
+  @media (max-width: 540px) {
+    .tool-container {
+      padding: 0 12px;
+    }
+    .main-tool-card {
+      padding: 20px 12px;
+      border-radius: 18px;
+    }
+    .lottie-scan-stage {
+      width: 90%;
+      max-width: 380px;
+      margin: 0 auto;
+      padding: 20px 12px;
+    }
+    .processing-details {
+      width: 90%;
+      max-width: 380px;
+      margin: 16px auto 0;
+      padding: 4px;
+    }
+  }
+
+  @media (max-width: 375px) {
+    .tool-container {
+      padding: 0 6px;
+    }
+    .main-tool-card {
+      padding: 14px 6px;
+      border-radius: 14px;
+    }
+    .lottie-scan-stage {
+      width: 90%;
+      max-width: 380px;
+      margin: 0 auto;
+      padding: 16px 8px;
+    }
+    .scan-progress-box {
+      padding: 8px 10px;
+    }
+    .processing-details {
+      width: 90%;
+      max-width: 380px;
+      margin: 12px auto 0;
+    }
+  }
+
+  @media (max-width: 330px) {
+    .tool-container {
+      padding: 0 4px;
+    }
+    .main-tool-card {
+      padding: 12px 4px;
+    }
+    .lottie-scan-stage {
+      width: 92%;
+      padding: 14px 6px;
+    }
   }
 
   /* ---------- Result View ---------- */
