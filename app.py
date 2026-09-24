@@ -1859,37 +1859,42 @@ PAGE = r"""<!doctype html>
     user-select: none;
     -webkit-user-select: none;
     touch-action: pan-y;
-    background: transparent;
+    background: transparent !important;
   }
   #homepage-split-slider {
     width: 100%;
     max-width: 100%;
-    aspect-ratio: 4 / 5;
+    aspect-ratio: 1856 / 2304;
     padding: 0;
     margin: 0;
+    background: transparent !important;
   }
   #user-split-slider {
     width: 100%;
     max-width: 620px;
     padding: 0;
     margin: 0 auto;
+    background: transparent !important;
   }
   .split-layer {
     position: absolute;
-    top: 0;
-    left: 0;
+    inset: 0;
     width: 100%;
     height: 100%;
     overflow: hidden;
     padding: 0;
     margin: 0;
+    background: transparent !important;
   }
   .split-img {
+    position: absolute;
+    inset: 0;
     width: 100%;
     height: 100%;
-    object-fit: cover;
+    object-fit: cover !important;
     display: block;
     pointer-events: none;
+    background: transparent !important;
   }
   .split-before {
     clip-path: polygon(0 0, 50% 0, 50% 100%, 0 100%);
@@ -2473,11 +2478,11 @@ PAGE = r"""<!doctype html>
     <div class="comp-visuals-wrapper">
       <div class="split-slider-container" id="homepage-split-slider">
         <div class="split-layer split-before">
-          <img src="/static/before.webp" alt="Original" class="split-img" loading="lazy">
+          <img src="/static/before.webp?v=4" width="1856" height="2304" alt="Original" class="split-img" loading="eager">
           <span class="split-label before-label">Original</span>
         </div>
         <div class="split-layer split-after" id="homepage-split-after">
-          <img src="/static/after.webp" alt="After - Watermark Removed" class="split-img" loading="lazy">
+          <img src="/static/after.webp?v=4" width="1856" height="2304" alt="After - Watermark Removed" class="split-img" loading="eager">
           <span class="split-label after-label">Watermark Removed</span>
         </div>
         <div class="split-handle" id="homepage-split-handle">
