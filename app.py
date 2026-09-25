@@ -4113,7 +4113,7 @@ function submitBoxErase() {
   const eraseBtn = document.getElementById('btn-box-erase');
   if (eraseBtn) {
     eraseBtn.disabled = true;
-    eraseBtn.innerHTML = '<span style="display:inline-block;width:12px;height:12px;border:2px solid #fff;border-top-color:transparent;border-radius:50%;animation:rotate 0.6s linear infinite;margin-right:6px;vertical-align:middle;"></span> Erasing with LaMa AI...';
+    eraseBtn.textContent = 'Erasing with AI...';
   }
 
   fetch('/api/reclean/' + currentJobId, {
