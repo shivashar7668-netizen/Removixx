@@ -3719,19 +3719,7 @@ function setZone(zone) {
 }
 
 function showToast(msg) {
-  let toast = document.getElementById('removix-toast');
-  if (!toast) {
-    toast = document.createElement('div');
-    toast.id = 'removix-toast';
-    toast.className = 'removix-toast';
-    document.body.appendChild(toast);
-  }
-  toast.textContent = msg;
-  toast.classList.add('show');
-  clearTimeout(toast._timer);
-  toast._timer = setTimeout(() => {
-    toast.classList.remove('show');
-  }, 3500);
+  // Toast notifications disabled per user request
 }
 
 function triggerDownload() {
@@ -3743,7 +3731,6 @@ function triggerDownload() {
     .then(r => r.json())
     .then(data => {
       if (data && data.status === 'ok') {
-        showToast('✓ Saved to Downloads: ' + data.filename);
         if (!isDesktop) {
           fallbackBrowserDownload();
         }
