@@ -4,11 +4,11 @@
   "version": "1.0.9",
   "description": "Identify and remove AI provenance marks from images and video the user generated or edited, using the remove-ai-watermarks CLI.",
   "author": {
-    "name": "wiltodelta",
-    "url": "https://github.com/wiltodelta"
+    "name": "Shivank Thakur",
+    "url": "https://shivankthakur.com/"
   },
-  "homepage": "https://raiw.cc",
-  "repository": "https://github.com/wiltodelta/remove-ai-watermarks",
+  "homepage": "https://removix.sanvox.in",
+  "repository": "https://github.com/shivankthakurr/Removix",
   "license": "Apache-2.0",
   "skills": "./",
   "keywords": [

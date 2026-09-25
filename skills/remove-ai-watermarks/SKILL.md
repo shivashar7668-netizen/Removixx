@@ -4,10 +4,10 @@ description: "Removes and identifies AI watermarks and provenance marks in image
 license: Apache-2.0
 compatibility: Python 3.11-3.14. Invisible image removal needs NVIDIA CUDA. Some video writes need ffmpeg. Installer may be uv, pipx, or pip.
 metadata:
-  author: wiltodelta
+  author: Shivank Thakur
   version: "1.0.9"
-  homepage: https://raiw.cc
-  repository: https://github.com/wiltodelta/remove-ai-watermarks
+  homepage: https://removix.sanvox.in
+  repository: https://github.com/shivankthakurr/Removix
 ---
 
 # Remove AI watermarks

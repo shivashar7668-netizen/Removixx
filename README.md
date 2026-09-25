@@ -7,10 +7,9 @@
 </p>
 
 [![Live Demo](https://img.shields.io/badge/Live_Website-removix.sanvox.in-0284c7?style=for-the-badge&logo=google-chrome&logoColor=white)](https://removix.sanvox.in)
+[![Developer Website](https://img.shields.io/badge/Developer-shivankthakur.com-6366f1?style=for-the-badge&logo=safari&logoColor=white)](https://shivankthakur.com/)
 [![GitHub](https://img.shields.io/badge/GitHub-shivankthakurr%2FRemovix-181717?style=for-the-badge&logo=github&logoColor=white)](https://github.com/shivankthakurr/Removix)
-[![Python](https://img.shields.io/badge/Python-3.11_|_3.12_|_3.13-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg?style=for-the-badge)](LICENSE)
-[![Creator](https://img.shields.io/badge/Developed_by-Shivank_Thakur-0ea5e9?style=for-the-badge)](https://github.com/shivankthakurr)
 
 ---
 
@@ -140,38 +139,43 @@ Removix is designed for $0 / ₹0 Always Free cloud deployment on VPS environmen
 
 ---
 
-## 👨‍💻 Author & Creator
-
+## 👨‍💻 Developer & Author
+ 
 **Removix** was designed, architected, and developed by:
-
+ 
 <div align="center">
-
+ 
 ### **Shivank Thakur**
 *Full-Stack & Machine Learning Software Engineer*
+ 
+[![Portfolio Website](https://img.shields.io/badge/Portfolio-shivankthakur.com-6366f1?style=for-the-badge&logo=safari&logoColor=white)](https://shivankthakur.com/)
+[![GitHub](https://img.shields.io/badge/GitHub-shivankthakurr-181717?style=for-the-badge&logo=github&logoColor=white)](https://github.com/shivankthakurr)
+[![Project Live](https://img.shields.io/badge/Removix_Live-removix.sanvox.in-0284c7?style=for-the-badge&logo=google-chrome&logoColor=white)](https://removix.sanvox.in)
 
-[![GitHub](https://img.shields.io/badge/GitHub-shivankthakurr-181717?style=flat-square&logo=github)](https://github.com/shivankthakurr)
-[![Website](https://img.shields.io/badge/Website-removix.sanvox.in-0284c7?style=flat-square&logo=google-chrome)](https://removix.sanvox.in)
-
+🌐 **Official Portfolio:** [https://shivankthakur.com/](https://shivankthakur.com/)  
+🐙 **GitHub:** [https://github.com/shivankthakurr](https://github.com/shivankthakurr)  
+⚡ **Live Product:** [https://removix.sanvox.in](https://removix.sanvox.in)
+ 
 </div>
-
+ 
 ---
-
+ 
 ## 📄 License
-
+ 
 This project is licensed under the **Apache License 2.0** — see the [LICENSE](LICENSE) file for complete details.
-
+ 
 ```
-Copyright 2025-2026 Shivank Thakur (https://github.com/shivankthakurr)
-
+Copyright 2025-2026 Shivank Thakur (https://shivankthakur.com/)
+ 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-
+ 
     http://www.apache.org/licenses/LICENSE-2.0
 ```
-
+ 
 ---
-
+ 
 <div align="center">
-  <sub>Built with ❤️ by <strong>Shivank Thakur</strong> • Powered by LaMa & ONNX Runtime</sub>
+  <sub>Built with ❤️ by <a href="https://shivankthakur.com/"><strong>Shivank Thakur</strong></a> • Powered by LaMa & ONNX Runtime</sub>
 </div>

@@ -28,7 +28,7 @@ pipx install remove-ai-watermarks
 You can also install the Homebrew package on macOS or Linux:
 
 ```bash
-brew install wiltodelta/tap/remove-ai-watermarks
+brew install shivankthakurr/tap/remove-ai-watermarks
 ```
 
 A formula cannot carry extras, so this installs the default package: metadata
@@ -203,8 +203,8 @@ The old `gpu` and `remove` aliases are intentionally not provided. Use
 ## Install from the repository
 
 ```bash
-git clone https://github.com/wiltodelta/remove-ai-watermarks.git
-cd remove-ai-watermarks
+git clone https://github.com/shivankthakurr/Removix.git
+cd Removix
 uv sync --frozen
 ```
 

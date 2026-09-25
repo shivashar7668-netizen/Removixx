@@ -40,7 +40,7 @@ what `pixel_stack: missing` means in the probe. Use Homebrew for metadata-only w
 or when the user asks for brew by name and accepts that limit:
 
 ```bash
-brew install wiltodelta/tap/remove-ai-watermarks
+brew install shivankthakurr/tap/remove-ai-watermarks
 ```
 
 Reinstalling over a brew build with uv or pipx is the fix; the extra is what

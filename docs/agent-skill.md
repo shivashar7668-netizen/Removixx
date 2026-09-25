@@ -12,13 +12,13 @@ Any agent that speaks the [Agent Skills](https://agentskills.io/specification)
 format:
 
 ```bash
-npx skills add wiltodelta/remove-ai-watermarks
+npx skills add shivankthakurr/Removix
 ```
 
 Claude Code, from this repository as a marketplace:
 
 ```text
-/plugin marketplace add wiltodelta/remove-ai-watermarks
+/plugin marketplace add shivankthakurr/Removix
 /plugin install remove-ai-watermarks@remove-ai-watermarks
 ```
 
@@ -37,7 +37,7 @@ widen the scope.
 
 Do these in order after the skill is on the default branch.
 
-1. **GitHub default branch.** Unlocks `npx skills add wiltodelta/remove-ai-watermarks`.
+1. **GitHub default branch.** Unlocks `npx skills add shivankthakurr/Removix`.
    Cursor, OpenCode, Pi, Codex, and Copilot have no separate skill store; they
    consume this repo or a copied `SKILL.md`.
 2. **SkillsMP.** Aggregates public GitHub `SKILL.md` files. No submit form. A

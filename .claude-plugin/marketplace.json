@@ -1,8 +1,8 @@
 {
   "name": "remove-ai-watermarks",
   "owner": {
-    "name": "wiltodelta",
-    "url": "https://github.com/wiltodelta"
+    "name": "Shivank Thakur",
+    "url": "https://shivankthakur.com/"
   },
   "metadata": {
     "description": "Agent skill and Claude Code plugin for the remove-ai-watermarks CLI.",

@@ -158,9 +158,9 @@ must update the skill in the same commit. User-facing install steps live in
 
 After the skill files reach the default branch:
 
-- `npx skills add wiltodelta/remove-ai-watermarks` installs from GitHub;
+- `npx skills add shivankthakurr/Removix` installs from GitHub;
 - SkillsMP can index the public `SKILL.md`;
-- Claude Code users can run `/plugin marketplace add wiltodelta/remove-ai-watermarks`.
+- Claude Code users can run `/plugin marketplace add shivankthakurr/Removix`.
 
 ClawHub publishes automatically: the `clawhub` job in `distribute.yml` compares
 the `SKILL.md` version with the published one on every GitHub Release and
