@@ -511,6 +511,8 @@ def process_image_direct(job_id, in_path, out_path, custom_box=None, corner_mode
 
 def process_video_direct(job_id, in_path, out_path, custom_box=None, corner_mode=None):
     import cv2
+    import numpy as np
+    from dataclasses import replace
     from remove_ai_watermarks.video import (
         VIDEO_VISIBLE_MARKS,
         _select_stable_visible_mark,
@@ -537,9 +539,109 @@ def process_video_direct(job_id, in_path, out_path, custom_box=None, corner_mode
         staged_video_output,
         VideoScan,
     )
+    from remove_ai_watermarks.video_temporal import _backward_map, _backward_warp
     from remove_ai_watermarks.video_encoding import mux_encoded_video
     from remove_ai_watermarks.metadata import get_ai_metadata, strip_and_verify
     from remove_ai_watermarks.watermark_registry import fill, resolve_backend
+
+    def _temporal_lama_inpaint(
+        f_idx,
+        source_frame,
+        mask,
+        prev_source,
+        prev_cleaned,
+        prev_mask,
+        backend,
+        keyframe_interval=4,
+    ):
+        if mask is None or not np.any(mask > 0):
+            return source_frame
+
+        # Always run full LaMa neural network on keyframes or when prior frame is unavailable
+        is_keyframe = (f_idx % keyframe_interval == 0) or prev_cleaned is None or prev_mask is None
+        if is_keyframe:
+            cleaned = fill(source_frame, mask, backend=backend)
+            if prev_source is not None and prev_cleaned is not None and prev_mask is not None:
+                cleaned = stabilize_filled_frame(
+                    prev_source,
+                    prev_cleaned,
+                    prev_mask,
+                    source_frame,
+                    cleaned,
+                    mask,
+                    copy=False,
+                )
+            return cleaned
+
+        # Intermediate frames: propagate previous clean pixels using localized optical flow
+        union = (prev_mask > 0) | (mask > 0)
+        ys, xs = np.where(union)
+        if len(xs) == 0:
+            return source_frame.copy()
+
+        h, w = mask.shape
+        m_w = int(xs.max() - xs.min() + 1)
+        m_h = int(ys.max() - ys.min() + 1)
+        pad = max(24, round(max(m_w, m_h) * 0.75))
+        x0 = max(0, int(xs.min()) - pad)
+        y0 = max(0, int(ys.min()) - pad)
+        x1 = min(w, int(xs.max()) + pad + 1)
+        y1 = min(h, int(ys.max()) + pad + 1)
+
+        prev_src_crop = prev_source[y0:y1, x0:x1]
+        curr_src_crop = source_frame[y0:y1, x0:x1]
+        prev_cln_crop = prev_cleaned[y0:y1, x0:x1]
+        prev_msk_crop = prev_mask[y0:y1, x0:x1]
+        curr_msk_crop = mask[y0:y1, x0:x1]
+
+        try:
+            maps = _backward_map(
+                cv2.cvtColor(curr_src_crop, cv2.COLOR_BGR2GRAY),
+                cv2.cvtColor(prev_src_crop, cv2.COLOR_BGR2GRAY),
+            )
+            warped_prev_src = _backward_warp(prev_src_crop, maps)
+            warped_prev_cln = _backward_warp(prev_cln_crop, maps)
+            warped_prev_msk = _backward_warp(
+                prev_msk_crop,
+                maps,
+                interpolation=cv2.INTER_NEAREST,
+            )
+
+            curr_hole = curr_msk_crop > 0
+            covered = curr_hole & (warped_prev_msk > 0)
+
+            if np.any(curr_hole) and float(np.mean(covered[curr_hole])) >= 0.85:
+                occupied = curr_hole | (warped_prev_msk > 0)
+                dilation = max(7, round(max(m_w, m_h) * 0.25))
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilation | 1, dilation | 1))
+                context = cv2.dilate(occupied.astype(np.uint8), kernel).astype(bool) & ~occupied
+                if np.count_nonzero(context) >= 64:
+                    residual = np.abs(curr_src_crop.astype(np.float32) - warped_prev_src.astype(np.float32))
+                    context_residual = float(np.mean(residual[context]))
+                    if context_residual <= 14.0:
+                        # Smooth background motion: warp prior LaMa fill seamlessly
+                        result = source_frame.copy()
+                        result_crop = result[y0:y1, x0:x1]
+                        feather = cv2.GaussianBlur(curr_hole.astype(np.float32), (5, 5), 1.0)[..., None]
+                        blended = (1.0 - feather) * result_crop.astype(np.float32) + feather * warped_prev_cln.astype(np.float32)
+                        result_crop[curr_hole] = np.clip(blended[curr_hole], 0, 255).astype(np.uint8)
+                        return result
+        except Exception:
+            pass
+
+        # Sudden motion or scene cut: run full LaMa neural network
+        cleaned = fill(source_frame, mask, backend=backend)
+        if prev_source is not None and prev_cleaned is not None and prev_mask is not None:
+            cleaned = stabilize_filled_frame(
+                prev_source,
+                prev_cleaned,
+                prev_mask,
+                source_frame,
+                cleaned,
+                mask,
+                copy=False,
+            )
+        return cleaned
 
     source_path = Path(in_path)
     output_path = Path(out_path)
@@ -564,55 +666,31 @@ def process_video_direct(job_id, in_path, out_path, custom_box=None, corner_mode
 
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = float(capture.get(cv2.CAP_PROP_FPS))
+    fps = float(capture.get(cv2.CAP_PROP_FPS)) or 24.0
     total_est_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
 
-    detections = {mark: [] for mark in detectors}
-    timestamps = []
-    frame_index = 0
+    # Extract frame 0 for preview
+    ok0, frame0 = capture.read()
+    if ok0 and frame0 is not None:
+        try:
+            cv2.imwrite(str(job_dir / "preview_input.jpg"), frame0)
+        except Exception:
+            pass
 
-    while True:
-        ok, frame = capture.read()
-        if not ok:
-            break
-        if frame_index == 0:
-            try:
-                cv2.imwrite(str(job_dir / "preview_input.jpg"), frame)
-            except Exception:
-                pass
-        timestamps.append(float(capture.get(cv2.CAP_PROP_POS_MSEC)) / 1000)
-        if not custom_box:
-            prepared = _prepare_frame(frame)
-            for mark, detector in detectors.items():
-                detections[mark].append(
-                    detector(frame, frame_index=frame_index, prepared=prepared)
-                )
-        frame_index += 1
-        pct = 5 + int(min(frame_index / total_est_frames, 1.0) * 20)
-        set_job(job_id, stage="scanning", percent=pct, message=f"Scanning frame {frame_index}/{total_est_frames}...")
-
-    capture.release()
-    total_frames = frame_index or 1
-
-    shared_timestamps = tuple(timestamps)
+    # Read authoritative timestamps
     probed = probe_video_timestamps(source_path)
-    if len(probed) == total_frames:
-        shared_timestamps = probed
-
-    scans = {
-        mark: VideoScan(width, height, fps, tuple(detections[mark]), shared_timestamps)
-        for mark in detectors
-    }
-
-    set_job(job_id, stage="scanning", percent=25, message="Analyzing watermark recurrence & stability...")
+    total_frames = len(probed) if len(probed) > 0 else total_est_frames
+    shared_timestamps = probed if len(probed) > 0 else tuple(float(i) / max(1.0, fps) for i in range(total_frames))
 
     selected = None
     if custom_box and len(custom_box) == 4:
+        capture.release()
         cb_x, cb_y, cb_w, cb_h = custom_box
         regions = [(cb_x, cb_y, cb_w, cb_h)] * total_frames
         scan = VideoScan(width, height, fps, (), shared_timestamps)
         selected = ("custom_box", scan, regions, 0.04, "box")
     elif corner_mode == "bottom-left":
+        capture.release()
         wm_w = max(160, min(int(width * 0.20), 320))
         wm_h = max(50, min(int(height * 0.085), 110))
         margin_x = max(10, int(width * 0.015))
@@ -621,6 +699,7 @@ def process_video_direct(job_id, in_path, out_path, custom_box=None, corner_mode
         scan = VideoScan(width, height, fps, (), shared_timestamps)
         selected = ("bottom_left", scan, regions, 0.04, "box")
     elif corner_mode == "bottom-right":
+        capture.release()
         wm_w = max(160, min(int(width * 0.20), 320))
         wm_h = max(50, min(int(height * 0.085), 110))
         margin_x = max(10, int(width * 0.015))
@@ -629,10 +708,67 @@ def process_video_direct(job_id, in_path, out_path, custom_box=None, corner_mode
         scan = VideoScan(width, height, fps, (), shared_timestamps)
         selected = ("bottom_right", scan, regions, 0.04, "box")
     else:
-        # Auto mode: check registered detectors first
-        selected = _select_stable_visible_mark(scans, detected_metadata, VIDEO_VISIBLE_MARKS)
+        # Smart Fast-Scan (20-30 frames window as requested)
+        max_scan_frames = min(30, total_est_frames)
+        scan_frames = [(0, frame0)] if (ok0 and frame0 is not None) else []
+        for f_idx in range(1, max_scan_frames):
+            ok, f = capture.read()
+            if not ok:
+                break
+            scan_frames.append((f_idx, f))
+
+        detections = {mark: [] for mark in detectors}
+        confirmed_mark = None
+        for f_idx, f in scan_frames:
+            prepared = _prepare_frame(f)
+            for mark, detector in detectors.items():
+                det = detector(f, frame_index=f_idx, prepared=prepared)
+                detections[mark].append(det)
+                if getattr(det, "box", None) is not None:
+                    pos_count = sum(1 for d in detections[mark] if getattr(d, "box", None) is not None)
+                    if pos_count >= 2:
+                        confirmed_mark = mark
+            pct = 5 + int((f_idx / max_scan_frames) * 18)
+            set_job(job_id, stage="scanning", percent=pct, message=f"Scanning frame {f_idx + 1}/{max_scan_frames} for AI watermarks...")
+            if confirmed_mark and f_idx >= 15:
+                break
+
+        # If not found yet and video has many frames, check 2 sample frames at 50% and 80%
+        if not confirmed_mark and total_est_frames > 60:
+            for s_pct in (0.50, 0.80):
+                s_idx = int(total_est_frames * s_pct)
+                capture.set(cv2.CAP_PROP_POS_FRAMES, s_idx)
+                s_ok, s_frame = capture.read()
+                if s_ok and s_frame is not None:
+                    prepared = _prepare_frame(s_frame)
+                    for mark, detector in detectors.items():
+                        det = detector(s_frame, frame_index=s_idx, prepared=prepared)
+                        detections[mark].append(det)
+                        if getattr(det, "box", None) is not None:
+                            confirmed_mark = mark
+                            break
+                if confirmed_mark:
+                    break
+
+        capture.release()
+
+        # Build scans for detector verification
+        scans = {
+            mark: VideoScan(width, height, fps, tuple(detections[mark]), shared_timestamps[:len(detections[mark])])
+            for mark in detectors
+        }
+        set_job(job_id, stage="scanning", percent=25, message="Locking watermark coordinates...")
+        selected_candidate = _select_stable_visible_mark(scans, detected_metadata, VIDEO_VISIBLE_MARKS)
+        if selected_candidate is not None:
+            c_mark, c_scan, c_regions, c_pad, c_style = selected_candidate
+            found_box = next((r for r in c_regions if r is not None), None)
+            if found_box is not None:
+                regions = [found_box] * total_frames
+                scan = VideoScan(width, height, fps, (), shared_timestamps)
+                selected = (c_mark, scan, regions, c_pad, c_style)
+
         if selected is None:
-            # ── Universal AI Video Watermark Fallback (Runway, Luma, Pika, Kling, etc.) ──
+            # Universal AI Video Watermark Fallback (Runway, Luma, Pika, Kling, etc.)
             wm_w = max(160, min(int(width * 0.20), 320))
             wm_h = max(50, min(int(height * 0.085), 110))
             margin_x = max(10, int(width * 0.015))
@@ -688,6 +824,7 @@ def process_video_direct(job_id, in_path, out_path, custom_box=None, corner_mode
         previous_mask = None
 
         try:
+            KEYFRAME_INTERVAL = 4
             for f_idx, region in enumerate(regions):
                 ok, frame = capture.read()
                 if not ok:
@@ -701,21 +838,16 @@ def process_video_direct(job_id, in_path, out_path, custom_box=None, corner_mode
                         padding_fraction=padding_fraction,
                         mask_style=mask_style,
                     )
-                    frame = fill(frame, mask, backend=resolved_backend)
-                    if (
-                        previous_source is not None
-                        and previous_cleaned is not None
-                        and previous_mask is not None
-                    ):
-                        frame = stabilize_filled_frame(
-                            previous_source,
-                            previous_cleaned,
-                            previous_mask,
-                            source_frame,
-                            frame,
-                            mask,
-                            copy=False,
-                        )
+                    frame = _temporal_lama_inpaint(
+                        f_idx,
+                        source_frame,
+                        mask,
+                        previous_source,
+                        previous_cleaned,
+                        previous_mask,
+                        resolved_backend,
+                        keyframe_interval=KEYFRAME_INTERVAL,
+                    )
 
                 if f_idx == 0 or not (job_dir / "preview_output.jpg").exists():
                     try:
