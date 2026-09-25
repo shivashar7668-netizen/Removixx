@@ -447,6 +447,19 @@ def process_image_direct(job_id, in_path, out_path, custom_box=None, corner_mode
                 strip_metadata=True,
                 write_noop=True,
             )
+            job_dir = out_path.parent
+            if not out_path.exists() and report.image is not None:
+                cv2.imwrite(str(out_path), report.image)
+            if report.image is not None:
+                try:
+                    cv2.imwrite(str(job_dir / "preview_output.jpg"), report.image)
+                except Exception:
+                    pass
+            if loaded.bgr is not None:
+                try:
+                    cv2.imwrite(str(job_dir / "preview_input.jpg"), loaded.bgr)
+                except Exception:
+                    pass
             result_container["report"] = report
         except Exception as e:
             result_container["error"] = e
@@ -702,7 +715,7 @@ def process_video_direct(job_id, in_path, out_path, custom_box=None, corner_mode
                             copy=False,
                         )
 
-                if f_idx == 0:
+                if f_idx == 0 or not (job_dir / "preview_output.jpg").exists():
                     try:
                         cv2.imwrite(str(job_dir / "preview_output.jpg"), frame)
                     except Exception:
@@ -933,13 +946,27 @@ def upload():
 def status(job_id):
     with JOBS_LOCK:
         job = JOBS.get(job_id)
+    job_dir = WORKDIR / job_id
     if not job:
+        if job_dir.exists():
+            clean_files = [f for f in job_dir.glob("clean.*") if f.is_file() and f.stat().st_size > 0]
+            if clean_files:
+                is_img = clean_files[0].suffix.lower() in IMAGE_EXTS
+                return jsonify({
+                    "stage": "done",
+                    "percent": 100,
+                    "message": "Restoration complete",
+                    "error": None,
+                    "is_image": is_img,
+                    "input_url": f"/api/preview/{job_id}/input",
+                    "output_url": f"/api/preview/{job_id}/output",
+                })
         abort(404)
+
     ext = Path(job.get("filename", "")).suffix.lower()
     is_img = ext in IMAGE_EXTS
     is_done = job["stage"] == "done"
-    job_dir = WORKDIR / job_id
-    has_preview = is_img or (job_dir / "preview_output.jpg").exists()
+    has_preview = is_img or (job_dir / "preview_output.jpg").exists() or bool(list(job_dir.glob("clean.*")))
     return jsonify({
         "stage": job["stage"],
         "percent": job.get("percent", 0),
@@ -957,7 +984,23 @@ def stream(job_id):
         while True:
             with JOBS_LOCK:
                 job = JOBS.get(job_id)
+            job_dir = WORKDIR / job_id
             if not job:
+                if job_dir.exists():
+                    clean_files = [f for f in job_dir.glob("clean.*") if f.is_file() and f.stat().st_size > 0]
+                    if clean_files:
+                        is_img = clean_files[0].suffix.lower() in IMAGE_EXTS
+                        payload = {
+                            "stage": "done",
+                            "percent": 100,
+                            "message": "Restoration complete",
+                            "error": None,
+                            "is_image": is_img,
+                            "input_url": f"/api/preview/{job_id}/input",
+                            "output_url": f"/api/preview/{job_id}/output",
+                        }
+                        yield f"data: {json.dumps(payload)}\n\n"
+                        break
                 yield "event: error\ndata: {}\n\n"
                 break
 
@@ -968,8 +1011,7 @@ def stream(job_id):
             ext = Path(job.get("filename", "")).suffix.lower()
             is_img = ext in IMAGE_EXTS
             is_done = stage == "done"
-            job_dir = WORKDIR / job_id
-            has_preview = is_img or (job_dir / "preview_output.jpg").exists()
+            has_preview = is_img or (job_dir / "preview_output.jpg").exists() or bool(list(job_dir.glob("clean.*")))
 
             payload = {
                 "stage": stage,
@@ -1001,30 +1043,112 @@ def stream(job_id):
 def preview(job_id, which):
     with JOBS_LOCK:
         job = JOBS.get(job_id)
-    if not job:
-        abort(404)
-    ext = Path(job.get("filename", "")).suffix.lower()
     job_dir = WORKDIR / job_id
-    if ext in VIDEO_EXTS:
-        if which == "input":
-            p = job_dir / "preview_input.jpg"
-        elif which == "output":
-            p = job_dir / "preview_output.jpg"
-        else:
-            abort(404)
-        if not p.exists():
-            abort(404)
-        return send_file(p, mimetype="image/jpeg")
+    if not job_dir.exists():
+        abort(404)
+
+    target_file = None
+    if which == "output":
+        # 1. Preview jpg first (super fast and 100% universal across browsers)
+        cand = job_dir / "preview_output.jpg"
+        if cand.exists() and cand.stat().st_size > 0:
+            target_file = cand
+        # 2. In-memory job out_path if it's an image
+        if target_file is None and job and job.get("out_path"):
+            cand = Path(job["out_path"])
+            if cand.exists() and cand.stat().st_size > 0 and cand.suffix.lower() not in VIDEO_EXTS:
+                target_file = cand
+        # 3. Clean image files on disk
+        if target_file is None:
+            for ext in [".png", ".webp", ".jpg", ".jpeg"]:
+                cand = job_dir / f"clean{ext}"
+                if cand.exists() and cand.stat().st_size > 0:
+                    target_file = cand
+                    break
+        # 4. Any clean.* or output.* images on disk
+        if target_file is None:
+            for cand in sorted(list(job_dir.glob("clean.*")) + list(job_dir.glob("output.*"))):
+                if cand.is_file() and cand.stat().st_size > 0 and cand.suffix.lower() not in VIDEO_EXTS:
+                    target_file = cand
+                    break
+        # 5. For video output, extract frame 0 on the fly if needed
+        if target_file is None:
+            for cand in sorted(job_dir.glob("clean.*")):
+                if cand.suffix.lower() in VIDEO_EXTS and cand.stat().st_size > 0:
+                    try:
+                        import cv2
+                        cap = cv2.VideoCapture(str(cand))
+                        ok, f0 = cap.read()
+                        cap.release()
+                        if ok and f0 is not None:
+                            out_jpg = job_dir / "preview_output.jpg"
+                            cv2.imwrite(str(out_jpg), f0)
+                            target_file = out_jpg
+                            break
+                    except Exception:
+                        pass
+        # 6. Fallback to preview_input.jpg if needed
+        if target_file is None:
+            cand = job_dir / "preview_input.jpg"
+            if cand.exists() and cand.stat().st_size > 0:
+                target_file = cand
+
     elif which == "input":
-        p = job_dir / f"input{ext}"
-    elif which == "output":
-        p = Path(job["out_path"])
+        # 1. Preview jpg first
+        cand = job_dir / "preview_input.jpg"
+        if cand.exists() and cand.stat().st_size > 0:
+            target_file = cand
+        # 2. Input image files
+        if target_file is None:
+            for ext in [".png", ".webp", ".jpg", ".jpeg"]:
+                cand = job_dir / f"input{ext}"
+                if cand.exists() and cand.stat().st_size > 0:
+                    target_file = cand
+                    break
+        # 3. Any input.* images
+        if target_file is None:
+            for cand in sorted(job_dir.glob("input.*")):
+                if cand.is_file() and cand.stat().st_size > 0 and cand.suffix.lower() not in VIDEO_EXTS:
+                    target_file = cand
+                    break
+        # 4. If video input, extract frame 0 on the fly
+        if target_file is None:
+            for cand in sorted(job_dir.glob("input.*")):
+                if cand.suffix.lower() in VIDEO_EXTS and cand.stat().st_size > 0:
+                    try:
+                        import cv2
+                        cap = cv2.VideoCapture(str(cand))
+                        ok, f0 = cap.read()
+                        cap.release()
+                        if ok and f0 is not None:
+                            in_jpg = job_dir / "preview_input.jpg"
+                            cv2.imwrite(str(in_jpg), f0)
+                            target_file = in_jpg
+                            break
+                    except Exception:
+                        pass
     else:
         abort(404)
-    if not p.exists():
+
+    if not target_file or not target_file.exists():
         abort(404)
-    mimetype = "image/png" if ext == ".png" else "image/jpeg" if ext in {".jpg", ".jpeg"} else "image/webp" if ext == ".webp" else None
-    return send_file(p, mimetype=mimetype)
+
+    ext = target_file.suffix.lower()
+    mimetypes_map = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+        ".svg": "image/svg+xml",
+        ".mp4": "video/mp4",
+        ".mov": "video/quicktime",
+        ".webm": "video/webm",
+    }
+    mimetype = mimetypes_map.get(ext, "image/jpeg")
+    resp = send_file(str(target_file), mimetype=mimetype)
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    return resp
 
 
 def detect_watermark_in_box(img, box):
@@ -1292,9 +1416,14 @@ def save_to_downloads(job_id):
 def download(job_id):
     with JOBS_LOCK:
         job = JOBS.get(job_id)
-    if not job or job["stage"] != "done":
-        abort(404)
-    return send_file(job["out_path"], as_attachment=True, download_name=f"removix_{job['filename']}")
+    job_dir = WORKDIR / job_id
+    if job and job.get("out_path") and Path(job["out_path"]).exists():
+        return send_file(job["out_path"], as_attachment=True, download_name=f"removix_{job['filename']}")
+    for cand in sorted(list(job_dir.glob("clean.*")) + list(job_dir.glob("output.*"))):
+        if cand.is_file() and cand.stat().st_size > 0:
+            fn = job.get("filename", cand.name) if job else cand.name
+            return send_file(str(cand), as_attachment=True, download_name=f"removix_{fn}")
+    abort(404)
 
 
 LOTTIE_FILE = BUNDLE_DIR / "lottie_scan.json"
@@ -1318,16 +1447,36 @@ def get_lottie_script():
 
 
 @app.route("/static/before.webp")
+@app.route("/before.webp")
 def get_before_img():
-    if BEFORE_WEBP.exists():
-        return send_file(BEFORE_WEBP, mimetype="image/webp")
+    candidates = [
+        BEFORE_WEBP,
+        Path(__file__).resolve().parent / "before.webp",
+        Path.cwd() / "before.webp",
+        Path("/home/ubuntu/Removix/before.webp"),
+    ]
+    for p in candidates:
+        if p.exists() and p.is_file() and p.stat().st_size > 0:
+            resp = send_file(str(p), mimetype="image/webp")
+            resp.headers["Cache-Control"] = "public, max-age=86400"
+            return resp
     abort(404)
 
 
 @app.route("/static/after.webp")
+@app.route("/after.webp")
 def get_after_img():
-    if AFTER_WEBP.exists():
-        return send_file(AFTER_WEBP, mimetype="image/webp")
+    candidates = [
+        AFTER_WEBP,
+        Path(__file__).resolve().parent / "after.webp",
+        Path.cwd() / "after.webp",
+        Path("/home/ubuntu/Removix/after.webp"),
+    ]
+    for p in candidates:
+        if p.exists() and p.is_file() and p.stat().st_size > 0:
+            resp = send_file(str(p), mimetype="image/webp")
+            resp.headers["Cache-Control"] = "public, max-age=86400"
+            return resp
     abort(404)
 
 
@@ -1338,10 +1487,17 @@ REMOVIX_SVG = BUNDLE_DIR / "removix.svg"
 
 @app.route("/favicon.ico")
 def get_favicon_ico():
-    if REMOVIX_ICO.exists():
-        resp = send_file(REMOVIX_ICO, mimetype="image/x-icon")
-        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        return resp
+    candidates = [
+        REMOVIX_ICO,
+        Path(__file__).resolve().parent / "removix.ico",
+        Path.cwd() / "removix.ico",
+        Path("/home/ubuntu/Removix/removix.ico"),
+    ]
+    for p in candidates:
+        if p.exists() and p.is_file() and p.stat().st_size > 0:
+            resp = send_file(str(p), mimetype="image/x-icon")
+            resp.headers["Cache-Control"] = "public, max-age=86400"
+            return resp
     abort(404)
 
 
@@ -1349,12 +1505,20 @@ def get_favicon_ico():
 @app.route("/static/removix-logo.svg")
 @app.route("/favicon.svg")
 def get_removix_svg():
-    if REMOVIX_SVG.exists():
-        resp = send_file(REMOVIX_SVG, mimetype="image/svg+xml")
-        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        return resp
+    candidates = [
+        REMOVIX_SVG,
+        Path(__file__).resolve().parent / "removix.svg",
+        Path.cwd() / "removix.svg",
+        Path("/home/ubuntu/Removix/removix.svg"),
+    ]
+    for p in candidates:
+        if p.exists() and p.is_file() and p.stat().st_size > 0:
+            resp = send_file(str(p), mimetype="image/svg+xml")
+            resp.headers["Cache-Control"] = "public, max-age=86400"
+            return resp
     if REMOVIX_PNG.exists():
-        resp = send_file(REMOVIX_PNG, mimetype="image/png")
+        resp = send_file(str(REMOVIX_PNG), mimetype="image/png")
+        resp.headers["Cache-Control"] = "public, max-age=86400"
         return resp
     abort(404)
 
@@ -1363,13 +1527,17 @@ def get_removix_svg():
 @app.route("/static/removix-logo.png")
 @app.route("/favicon.png")
 def get_removix_logo():
-    if REMOVIX_PNG.exists():
-        resp = send_file(REMOVIX_PNG, mimetype="image/png")
-        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        return resp
-    if REMOVIX_ICO.exists():
-        resp = send_file(REMOVIX_ICO, mimetype="image/x-icon")
-        return resp
+    candidates = [
+        REMOVIX_PNG,
+        Path(__file__).resolve().parent / "removix.png",
+        Path.cwd() / "removix.png",
+        Path("/home/ubuntu/Removix/removix.png"),
+    ]
+    for p in candidates:
+        if p.exists() and p.is_file() and p.stat().st_size > 0:
+            resp = send_file(str(p), mimetype="image/png")
+            resp.headers["Cache-Control"] = "public, max-age=86400"
+            return resp
     abort(404)
 
 
@@ -1462,7 +1630,7 @@ PAGE = r"""<!doctype html>
     object-fit: contain;
     display: block;
   }
-  .brand-icon svg { width: 16px; height: 16px; fill: white; }
+  .brand-icon svg { width: 100%; height: 100%; display: block; }
   .brand-name {
     font-size: 21.5px;
     font-weight: 800;
@@ -3067,7 +3235,9 @@ PAGE = r"""<!doctype html>
 <header class="top-header">
   <div class="brand-badge">
     <div class="brand-icon">
-      <img src="/static/removix.svg?v=5" alt="Removix Logo" class="brand-logo-img">
+      <svg class="brand-logo-img" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="Removix Logo">
+        <path d="m56.693 463.048c-12.974-15.793-15.047-37.869-5.237-55.796 7.387-13.498 13.718-28.467 18.996-44.911 9.16-28.554 16.229-57.886 21.215-87.986 4.976-30.102 8.16-59.045 9.561-86.829 1.391-27.786 2.091-50.94 2.091-69.463v-17.945h-23.568c-25.597 0-46.348-20.733-46.348-46.309 0-25.576 20.751-46.309 46.348-46.309h365.69c18.311 0 33.156 14.832 33.156 33.128v219.107c0 19.264-15.63 34.88-34.91 34.88h-1.594c-26.693 0-52.23-9.646-73.216-26.128-5.323-4.181-11.823-6.868-18.916-6.868-10.513 0-18.432 9.689-16.181 19.95 1.927 8.786 4.385 17.186 7.375 25.201 5.172 13.893 11.448 26.827 18.824 38.783 7.367 11.967 15.433 22.776 24.201 32.417 8.759 9.65 17.527 18.333 26.294 26.049 5.929 5.303 12.022 10.337 18.278 15.102 23.655 18.016 25.408 52.931 3.447 72.974-16.147 14.737-40.248 16.513-58.465 4.422-14.352-9.525-27.302-19.711-38.853-30.56-19.719-18.524-36.452-37.916-50.195-58.176-13.745-20.26-24.706-40.808-32.867-61.648-8.17-20.84-14.342-40.809-18.526-59.913-4.182-19.101-6.974-36.557-8.364-52.386-1.401-15.82-2.093-29.133-2.093-39.942 0-3.853 0-7.326 0-10.42 0-3.084.196-5.589.599-7.524 0-2.316.195-4.432.597-6.368h124.194c19.198 0 34.761-15.55 34.761-34.732 0-19.182-15.563-34.732-34.761-34.732h-111.621c-19.401 0-35.047 15.868-34.757 35.25l.07 4.69c0 33.575-1.494 64.643-4.482 93.197-2.988 28.563-6.871 54.901-11.652 79.014-4.781 24.123-10.158 45.93-16.134 65.412-5.976 19.491-12.158 36.757-18.526 51.807-3.388 8.158-6.881 15.979-10.478 23.464-15.872 33.026-60.69 38.415-83.953 10.098z" fill="#0ea5e9"/>
+      </svg>
     </div>
     <span class="brand-name">emovix</span>
   </div>
@@ -3390,11 +3560,11 @@ PAGE = r"""<!doctype html>
     <div class="comp-visuals-wrapper">
       <div class="split-slider-container" id="homepage-split-slider">
         <div class="split-layer split-before">
-          <img src="/static/before.webp?v=7" width="1684" height="2528" alt="Original" class="split-img" loading="eager">
+          <img src="/static/before.webp?v=8" onerror="if(this.src.indexOf('/before.webp')===-1)this.src='/before.webp'" width="1684" height="2528" alt="Original" class="split-img" loading="eager">
           <span class="split-label before-label">Original</span>
         </div>
         <div class="split-layer split-after" id="homepage-split-after">
-          <img src="/static/after.webp?v=7" width="1684" height="2528" alt="After - Watermark Removed" class="split-img" loading="eager">
+          <img src="/static/after.webp?v=8" onerror="if(this.src.indexOf('/after.webp')===-1)this.src='/after.webp'" width="1684" height="2528" alt="Watermark Removed" class="split-img" loading="eager">
           <span class="split-label after-label">Watermark Removed</span>
         </div>
         <div class="split-handle" id="homepage-split-handle">
@@ -4140,12 +4310,18 @@ function handleJob(job, jobId, filename) {
       // Live interactive split comparison for user upload
       const userWrap = document.getElementById('user-split-wrap');
       const modeBar = document.getElementById('result-mode-bar');
-      if (job.input_url && job.output_url && userWrap) {
+      const inUrl = job.input_url || ('/api/preview/' + jobId + '/input');
+      const outUrl = job.output_url || ('/api/preview/' + jobId + '/output');
+      if (userWrap) {
         const beforeImg = document.getElementById('user-img-before');
         const afterImg = document.getElementById('user-img-after');
         if (beforeImg && afterImg) {
-          beforeImg.src = job.input_url;
-          afterImg.src = job.output_url;
+          const cacheBust = '?t=' + Date.now();
+          beforeImg.src = inUrl + cacheBust;
+          afterImg.src = outUrl + cacheBust;
+          afterImg.onerror = () => {
+            setTimeout(() => { afterImg.src = outUrl + '?retry=1&t=' + Date.now(); }, 600);
+          };
           const userRange = document.getElementById('user-range');
           if (userRange) userRange.value = 50;
           userWrap.style.display = 'block';
