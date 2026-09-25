@@ -35,6 +35,7 @@ _warnings.filterwarnings("ignore", message=r".*ImageProcessorFast.*")
 
 
 __version__ = "0.42.0"
+__author__ = "Shivank Thakur"
 
 __all__ = [
     "BatchItemResult",
