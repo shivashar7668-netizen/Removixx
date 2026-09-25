@@ -458,19 +458,39 @@ def process_image_direct(job_id, in_path, out_path, custom_box=None, corner_mode
     worker_thread.start()
 
     current_pct = 35
+    elapsed_ticks = 0
     while worker_thread.is_alive():
         worker_thread.join(timeout=0.35)
-        if worker_thread.is_alive() and current_pct < 88:
+        if not worker_thread.is_alive():
+            break
+        elapsed_ticks += 1
+        # Dynamic continuous progression: smoothly moves through 35% -> 96% without ever freezing
+        if current_pct < 60:
             current_pct += 1
-            set_job(job_id, stage="removing", percent=current_pct, message="Reconstructing background with AI...")
+            msg = "Isolating watermark context & creating neural tensor..."
+        elif current_pct < 78:
+            if elapsed_ticks % 2 == 0:
+                current_pct += 1
+            msg = "Reconstructing background with LaMa Neural Network..."
+        elif current_pct < 90:
+            if elapsed_ticks % 3 == 0:
+                current_pct += 1
+            msg = "Synthesizing seamless textures & removing AI footprint..."
+        elif current_pct < 96:
+            if elapsed_ticks % 5 == 0:
+                current_pct += 1
+            msg = "Harmonizing color gradients & edge feathering..."
+        else:
+            current_pct = 96 if elapsed_ticks % 2 == 0 else 97
+            msg = "Finalizing photorealistic pixel blend..."
+
+        set_job(job_id, stage="removing", percent=current_pct, message=msg)
 
     if result_container["error"] is not None:
         raise result_container["error"]
 
-    set_job(job_id, stage="finalizing", percent=92, message="Validating seamless restoration...")
+    set_job(job_id, stage="finalizing", percent=98, message="Validating seamless restoration & stripping tags...")
     time.sleep(0.12)
-    set_job(job_id, stage="finalizing", percent=97, message="Stripping origin tags & finalizing...")
-    time.sleep(0.1)
     set_job(job_id, stage="done", percent=100, message="Restoration complete")
 
 
@@ -740,13 +760,23 @@ def run_job_cli_fallback(job_id, in_path, out_path, ext):
     stop_ticker = threading.Event()
     def ticker():
         curr = 25
+        ticks = 0
         while not stop_ticker.is_set():
             stop_ticker.wait(0.5)
             if stop_ticker.is_set():
                 break
-            if curr < 88:
+            ticks += 1
+            if curr < 65:
                 curr += 1
-                set_job(job_id, percent=curr)
+            elif curr < 85:
+                if ticks % 2 == 0:
+                    curr += 1
+            elif curr < 96:
+                if ticks % 4 == 0:
+                    curr += 1
+            else:
+                curr = 96 if ticks % 2 == 0 else 97
+            set_job(job_id, percent=curr)
     
     t_tick = threading.Thread(target=ticker, daemon=True)
     t_tick.start()
@@ -4182,6 +4212,15 @@ if __name__ == "__main__":
     is_server_mode = os.environ.get("RENDER") is not None or "--server" in sys.argv or "--headless" in sys.argv
 
     if is_server_mode:
+        def _warmup_worker():
+            try:
+                from remove_ai_watermarks import region_eraser
+                region_eraser._get_lama_session()
+                print("Removix AI: LaMa neural network pre-warmed in memory.")
+            except Exception as e:
+                print(f"Removix warm-up note: {e}")
+
+        threading.Thread(target=_warmup_worker, daemon=True).start()
         print(f"Starting Removix Server on http://0.0.0.0:{port}...")
         app.run(host="0.0.0.0", port=port, debug=False)
     else:

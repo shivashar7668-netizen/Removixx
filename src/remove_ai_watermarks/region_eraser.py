@@ -221,6 +221,7 @@ def _get_session(name: str, repo_id: str, filename: str, label: str) -> object:
     if cached is not None:
         return cached
 
+    import os
     import onnxruntime as ort
     from huggingface_hub import hf_hub_download
 
@@ -228,10 +229,12 @@ def _get_session(name: str, repo_id: str, filename: str, label: str) -> object:
     logger.info("Loading %s model: %s", label, model_path)
 
     opts = ort.SessionOptions()
-    opts.enable_cpu_mem_arena = False
-    opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-    opts.intra_op_num_threads = 1
-    opts.inter_op_num_threads = 1
+    opts.enable_cpu_mem_arena = True
+    opts.execution_mode = ort.ExecutionMode.ORT_PARALLEL
+    threads = max(1, os.cpu_count() or 2)
+    opts.intra_op_num_threads = threads
+    opts.inter_op_num_threads = threads
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     session = ort.InferenceSession(model_path, sess_options=opts, providers=["CPUExecutionProvider"])
     _sessions[name] = session
     return session
