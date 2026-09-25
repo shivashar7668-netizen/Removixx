@@ -2634,11 +2634,11 @@ PAGE = r"""<!doctype html>
     position: absolute;
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
     background: #0f172a;
     border: 1px solid rgba(255, 255, 255, 0.18);
     color: #ffffff;
-    padding: 6px 12px;
+    padding: 4px 6px;
     border-radius: 8px;
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
     font-size: 12px;
@@ -2653,22 +2653,6 @@ PAGE = r"""<!doctype html>
   }
   .box-floating-bar:active {
     cursor: grabbing;
-  }
-  .box-drag-handle {
-    color: #94a3b8;
-    font-size: 15px;
-    line-height: 1;
-    cursor: grab;
-    display: inline-flex;
-    align-items: center;
-    padding-right: 2px;
-    user-select: none;
-  }
-  .box-status-text {
-    font-size: 12px;
-    color: #f1f5f9;
-    font-weight: 600;
-    user-select: none;
   }
   .removix-toast {
     position: fixed;
@@ -3215,8 +3199,6 @@ PAGE = r"""<!doctype html>
           <div class="box-draw-overlay" id="box-draw-overlay" style="display:none;">
             <div class="box-selection-rect" id="box-selection-rect" style="display:none;"></div>
             <div class="box-floating-bar" id="box-floating-bar" style="display:none;" title="Drag anywhere to move bar">
-              <span class="box-drag-handle" title="Drag to move">⠿</span>
-              <span class="box-status-text" id="box-status-text">Selected Area</span>
               <button type="button" class="btn-box-erase" id="btn-box-erase" onclick="submitBoxErase()">⚡ Erase with AI</button>
               <button type="button" class="btn-box-cancel" onclick="cancelBoxSelection()" title="Cancel">✕</button>
             </div>
@@ -3715,8 +3697,8 @@ function positionFloatBar() {
   if (!overlay || !floatBar || !activeBox) return;
 
   floatBar.style.display = 'flex';
-  const barWidth = floatBar.offsetWidth || 230;
-  const barHeight = floatBar.offsetHeight || 38;
+  const barWidth = floatBar.offsetWidth || 140;
+  const barHeight = floatBar.offsetHeight || 32;
   const pad = 8;
   const ovW = overlay.clientWidth;
   const ovH = overlay.clientHeight;
