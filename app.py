@@ -188,10 +188,12 @@ def _patch_lama_engine():
                     raise
 
             so = ort.SessionOptions()
-            so.enable_cpu_mem_arena = False
-            so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            so.enable_cpu_mem_arena = True
+            so.execution_mode = ort.ExecutionMode.ORT_PARALLEL
             so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            so.intra_op_num_threads = max(1, min(os.cpu_count() or 1, 4))
+            threads = max(1, os.cpu_count() or 2)
+            so.intra_op_num_threads = threads
+            so.inter_op_num_threads = threads
 
             available = ort.get_available_providers()
             session = None
@@ -1147,7 +1149,9 @@ def preview(job_id, which):
     }
     mimetype = mimetypes_map.get(ext, "image/jpeg")
     resp = send_file(str(target_file), mimetype=mimetype)
-    resp.headers["Cache-Control"] = "public, max-age=3600"
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
     return resp
 
 
@@ -1257,8 +1261,11 @@ def detect_watermark_in_box(img, box):
 def detect_box(job_id):
     with JOBS_LOCK:
         job = JOBS.get(job_id)
+    job_dir = WORKDIR / job_id
     if not job:
-        abort(404)
+        if not job_dir.exists():
+            abort(404)
+        job = {"id": job_id, "filename": "image.jpg"}
 
     data = request.get_json(silent=True) or request.form or {}
     box = data.get("box")
@@ -1272,7 +1279,6 @@ def detect_box(job_id):
         return jsonify({"error": "Invalid box coordinates"}), 400
 
     ext = Path(job.get("filename", "")).suffix.lower()
-    job_dir = WORKDIR / job_id
 
     import cv2
     img = None
@@ -1300,8 +1306,25 @@ def detect_box(job_id):
 def reclean(job_id):
     with JOBS_LOCK:
         job = JOBS.get(job_id)
+    job_dir = WORKDIR / job_id
     if not job:
-        abort(404)
+        if not job_dir.exists():
+            abort(404)
+        in_files = list(job_dir.glob("input.*"))
+        out_files = list(job_dir.glob("clean.*"))
+        if not in_files and not out_files:
+            abort(404)
+        fname = in_files[0].name if in_files else (out_files[0].name if out_files else "image.jpg")
+        out_p = str(out_files[0]) if out_files else str(job_dir / f"clean{Path(fname).suffix}")
+        job = {
+            "id": job_id,
+            "filename": fname,
+            "out_path": out_p,
+            "stage": "done",
+            "percent": 100,
+        }
+        with JOBS_LOCK:
+            JOBS[job_id] = job
 
     data = request.get_json(silent=True) or request.form or {}
     box = data.get("box")
@@ -1315,32 +1338,66 @@ def reclean(job_id):
         return jsonify({"error": "Invalid box coordinates"}), 400
 
     ext = Path(job.get("filename", "")).suffix.lower()
-    job_dir = WORKDIR / job_id
-    out_path = Path(job["out_path"])
+    out_path = Path(job.get("out_path", job_dir / f"clean{ext}"))
 
     if ext in IMAGE_EXTS:
         import cv2
         import numpy as np
         from remove_ai_watermarks import region_eraser
 
-        target_img = cv2.imread(str(job_dir / f"input{ext}"))
+        # Read existing clean image if available to erase on top of previous clean passes
+        target_img = None
+        if out_path.exists() and out_path.stat().st_size > 0:
+            target_img = cv2.imread(str(out_path), cv2.IMREAD_UNCHANGED)
         if target_img is None:
-            target_img = cv2.imread(str(out_path))
+            for cand in [job_dir / f"clean{ext}", job_dir / "preview_output.jpg"]:
+                if cand.exists() and cand.stat().st_size > 0:
+                    target_img = cv2.imread(str(cand), cv2.IMREAD_UNCHANGED)
+                    if target_img is not None:
+                        break
+        # Fall back to original input image
+        if target_img is None:
+            target_img = cv2.imread(str(job_dir / f"input{ext}"), cv2.IMREAD_UNCHANGED)
 
         if target_img is None:
             return jsonify({"error": "Could not read image file"}), 500
 
-        bx, by, bw, bh = box
+        # Normalize and clamp box coordinates to image dimensions
+        bx, by, bw, bh = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+        if bw < 0:
+            bx += bw
+            bw = abs(bw)
+        if bh < 0:
+            by += bh
+            bh = abs(bh)
+
+        h, w = target_img.shape[:2]
+        bx = max(0, min(w - 1, bx))
+        by = max(0, min(h - 1, by))
+        bw = max(1, min(w - bx, bw))
+        bh = max(1, min(h - by, bh))
+
+        # Erase selected object/region using the high-accuracy LaMa neural network
         cleaned = region_eraser.erase(
             target_img,
             boxes=[(bx, by, bw, bh)],
             backend="lama",
+            dilate=5,
         )
+
+        # Write clean output file
         cv2.imwrite(str(out_path), cleaned)
+
+        # Crucial: update preview_output.jpg so preview endpoint immediately shows the erased result
+        preview_jpg = job_dir / "preview_output.jpg"
+        preview_bgr = cleaned[:, :, :3] if cleaned.ndim == 3 and cleaned.shape[2] == 4 else cleaned
+        cv2.imwrite(str(preview_jpg), preview_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+
+        ts = int(time.time() * 1000)
         return jsonify({
             "status": "ok",
             "message": "Selected area erased with LaMa AI",
-            "output_url": f"/api/preview/{job_id}/output?t={time.time()}",
+            "output_url": f"/api/preview/{job_id}/output?t={ts}",
         })
     elif ext in VIDEO_EXTS:
         in_path = job_dir / f"input{ext}"
@@ -4051,6 +4108,7 @@ function submitBoxErase() {
   if (!afterImg || !overlay) return;
 
   const r = overlay.getBoundingClientRect();
+  if (r.width <= 0 || r.height <= 0) return;
   const naturalW = afterImg.naturalWidth || r.width;
   const naturalH = afterImg.naturalHeight || r.height;
   const scaleX = naturalW / r.width;
@@ -4060,10 +4118,15 @@ function submitBoxErase() {
   const imgW = Math.min(naturalW - imgX, Math.round(activeBox.w * scaleX));
   const imgH = Math.min(naturalH - imgY, Math.round(activeBox.h * scaleY));
 
+  if (imgW < 4 || imgH < 4) {
+    alert('Selected area is too small. Please drag a box over the watermark.');
+    return;
+  }
+
   const eraseBtn = document.getElementById('btn-box-erase');
   if (eraseBtn) {
     eraseBtn.disabled = true;
-    eraseBtn.textContent = 'Erasing with AI...';
+    eraseBtn.innerHTML = '<span style="display:inline-block;width:12px;height:12px;border:2px solid #fff;border-top-color:transparent;border-radius:50%;animation:rotate 0.6s linear infinite;margin-right:6px;vertical-align:middle;"></span> Erasing with LaMa AI...';
   }
 
   fetch('/api/reclean/' + currentJobId, {
@@ -4078,9 +4141,20 @@ function submitBoxErase() {
       eraseBtn.textContent = '⚡ Erase with AI';
     }
     if (data.output_url) {
-      afterImg.src = data.output_url;
-      cancelBoxSelection();
-      setResultMode('slider');
+      const bustUrl = data.output_url + (data.output_url.indexOf('?') === -1 ? '?' : '&') + '_t=' + Date.now();
+      const freshImg = new Image();
+      freshImg.onload = () => {
+        afterImg.src = bustUrl;
+        setupSplitSlider('user-split-slider');
+        cancelBoxSelection();
+        setResultMode('slider');
+      };
+      freshImg.onerror = () => {
+        afterImg.src = bustUrl;
+        cancelBoxSelection();
+        setResultMode('slider');
+      };
+      freshImg.src = bustUrl;
     } else if (data.job_id) {
       cancelBoxSelection();
       setResultMode('slider');
@@ -4098,6 +4172,8 @@ function submitBoxErase() {
       eraseBtn.disabled = false;
       eraseBtn.textContent = '⚡ Erase with AI';
     }
+    console.error('Erase error:', err);
+    alert('Could not erase selected area. Please try again.');
   });
 }
 
