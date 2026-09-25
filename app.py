@@ -460,28 +460,28 @@ def process_image_direct(job_id, in_path, out_path, custom_box=None, corner_mode
     current_pct = 35
     elapsed_ticks = 0
     while worker_thread.is_alive():
-        worker_thread.join(timeout=0.35)
+        worker_thread.join(timeout=0.4)
         if not worker_thread.is_alive():
             break
         elapsed_ticks += 1
-        # Dynamic continuous progression: smoothly moves through 35% -> 96% without ever freezing
+        # Strictly increasing monotonic progression:
         if current_pct < 60:
-            current_pct += 1
+            if elapsed_ticks % 2 == 0:
+                current_pct += 1
             msg = "Isolating watermark context & creating neural tensor..."
-        elif current_pct < 78:
+        elif current_pct < 80:
             if elapsed_ticks % 2 == 0:
                 current_pct += 1
             msg = "Reconstructing background with LaMa Neural Network..."
-        elif current_pct < 90:
+        elif current_pct < 92:
             if elapsed_ticks % 3 == 0:
                 current_pct += 1
             msg = "Synthesizing seamless textures & removing AI footprint..."
-        elif current_pct < 96:
+        elif current_pct < 98:
             if elapsed_ticks % 5 == 0:
                 current_pct += 1
             msg = "Harmonizing color gradients & edge feathering..."
         else:
-            current_pct = 96 if elapsed_ticks % 2 == 0 else 97
             msg = "Finalizing photorealistic pixel blend..."
 
         set_job(job_id, stage="removing", percent=current_pct, message=msg)
@@ -771,11 +771,9 @@ def run_job_cli_fallback(job_id, in_path, out_path, ext):
             elif curr < 85:
                 if ticks % 2 == 0:
                     curr += 1
-            elif curr < 96:
+            elif curr < 98:
                 if ticks % 4 == 0:
                     curr += 1
-            else:
-                curr = 96 if ticks % 2 == 0 else 97
             set_job(job_id, percent=curr)
     
     t_tick = threading.Thread(target=ticker, daemon=True)
@@ -3621,8 +3619,14 @@ dropzone.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === '
 fileInput.addEventListener('change', e => { if (e.target.files[0]) startJob(e.target.files[0]); });
 resetBtn.addEventListener('click', resetUI);
 
+let maxProgressSeen = 0;
 function setProgress(percent, msg) {
-  const p = Math.max(0, Math.min(100, (percent !== null && percent !== undefined) ? percent : 0));
+  let p = Math.max(0, Math.min(100, (percent !== null && percent !== undefined) ? percent : 0));
+  if (p < maxProgressSeen && p > 0 && maxProgressSeen < 100) {
+    p = maxProgressSeen;
+  } else {
+    maxProgressSeen = p;
+  }
   if (ringPct) ringPct.textContent = Math.round(p) + '%';
   if (playerProgressFill) playerProgressFill.style.width = p + '%';
   if (msg && stageSub) {
@@ -3634,6 +3638,7 @@ function setProgress(percent, msg) {
 }
 
 function resetUI() {
+  maxProgressSeen = 0;
   cleanupStream();
   processingEl.classList.remove('active');
   resultEl.classList.remove('active');
