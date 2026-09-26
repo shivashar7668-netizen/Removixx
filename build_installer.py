@@ -64,6 +64,8 @@ def build():
 
     datas = [
         f"{ROOT / 'src'};src",
+        f"{ROOT / 'modules'};modules",
+        f"{ROOT / 'ui'};ui",
         f"{ROOT / 'before.webp'};.",
         f"{ROOT / 'after.webp'};.",
         f"{ROOT / 'removix.png'};.",
@@ -99,6 +101,12 @@ def build():
         cmd_pyi.extend(["--add-data", d])
 
     cmd_pyi.extend([
+        "--collect-all", "modules",
+        "--collect-all", "ui",
+        "--collect-all", "pymupdf",
+        "--collect-all", "resvg_py",
+        "--collect-all", "qrcode",
+        "--collect-all", "pytesseract",
         "--collect-all", "webview",
         "--collect-all", "pythonnet",
         "--collect-all", "clr_loader",

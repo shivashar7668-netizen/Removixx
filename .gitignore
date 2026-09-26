@@ -8,9 +8,16 @@ build/
 tmp/
 .sc/
 
-# Environment secrets
+# Environment secrets and credentials
 .env
+.env.*
+*.env
+!.env.example
 .mcp.json
+*.key
+*.pem
+*.secret
+credentials.json
 
 # OS files
 .DS_Store
@@ -39,9 +46,29 @@ data/research/
 # Reference materials
 _refs/
 
-# Downloaded model weights
+# Downloaded model weights (>100MB)
+models/
+*.onnx
+*.pt
+*.pth
+*.bin
+*.safetensors
 yolov8n.pt
 .coverage
+
+# Local database & user data
+*.db
+*.sqlite
+*.sqlite3
+data/activity.db
+data/settings.json
+
+# Scratch & temporary artifacts
+scratch_*.png
+scratch/
+test_*.png
+test_*.jpg
+test_*.pdf
 
 # Local prototype and evaluation outputs (research harnesses and probes); the
 # durable record of an oracle verdict lives under data/evaluations/

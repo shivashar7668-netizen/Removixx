@@ -1,22 +1,13 @@
 """
-Removix - AI Watermark Remover
---------------------------------
-Full site for Removix with:
-- Clean Removix header & Hero
-- Interactive Video & Image tool with upright SVG progress ring
-- 3 Feature Cards (Free tags)
-- Before & After visual comparison section
-- "Your images never leave your device" privacy section
-- Multi-column SaaS footer powered by Shivank Thakur
-
-Run:
-    python app.py
-Then open http://localhost:7860 (or the PORT you set).
+Removix - AI Media Suite & Watermark Remover
+--------------------------------------------
+Minimal application entry point and route dispatcher.
+All UI layout is organized in the `ui/` package.
+All media processing engines reside in the `modules/` package.
 """
 
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -24,23 +15,11 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import replace
 from pathlib import Path
 
-from flask import Flask, request, jsonify, send_file, abort, Response
+from flask import Flask, request, jsonify, send_file, abort, Response, redirect
 
-if sys.stdout is None:
-    try:
-        sys.stdout = open(os.devnull, "w")
-    except Exception:
-        pass
-if sys.stderr is None:
-    try:
-        sys.stderr = open(os.devnull, "w")
-    except Exception:
-        pass
-
-# Suppress any child process console windows (ffmpeg, ffprobe, etc.) on Windows
+# Suppress console windows on Windows subprocesses
 if sys.platform == "win32":
     _orig_popen = subprocess.Popen
 
@@ -53,937 +32,135 @@ if sys.platform == "win32":
 
     subprocess.Popen = _silent_popen
 
-# ── Logging to file (for diagnosing issues on end-user PCs) ──
-import logging
-_log_dir = Path(tempfile.gettempdir()) / "removix_logs"
-_log_dir.mkdir(exist_ok=True)
-logging.basicConfig(
-    filename=str(_log_dir / "removix.log"),
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    encoding="utf-8",
+# Import Processing Logic from modules/
+from modules.watermark_engine import (
+    BUNDLE_DIR,
+    WORKDIR,
+    VIDEO_EXTS,
+    IMAGE_EXTS,
+    JOBS,
+    JOBS_LOCK,
+    set_job,
+    run_job,
+    detect_watermark_in_box,
+    sanitize_error_message,
+)
+from modules.pdf_tools import images_to_pdf, pdf_to_images
+from modules.pdf_merge import merge_pdfs
+from modules.pdf_split import split_pdf
+from modules.pdf_rotate import rotate_pdf
+from modules.pdf_delete_pages import delete_pdf_pages
+from modules.pdf_protect import protect_pdf
+from modules.pdf_unlock import unlock_pdf
+from modules.word_to_pdf import word_to_pdf
+from modules.pdf_editor import (
+    add_text_to_pdf,
+    replace_text_in_pdf,
+    add_image_to_pdf,
+    add_shape_to_pdf,
+    annotate_pdf_text,
+    redact_pdf_area,
+)
+from modules.converter import convert_image, convert_media
+from modules.qr_generator import generate_qr
+from modules.ocr_tool import extract_text_from_file, PdfProcessingError
+from modules.bg_remover import (
+    is_model_available,
+    get_download_status,
+    trigger_model_download,
+    remove_background,
 )
 
-BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-SRC_DIR = BUNDLE_DIR / "src"
-if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
-
-UV_SITE_PACKAGES = Path.home() / "AppData" / "Roaming" / "uv" / "tools" / "remove-ai-watermarks" / "Lib" / "site-packages"
-if UV_SITE_PACKAGES.exists() and str(UV_SITE_PACKAGES) not in sys.path:
-    sys.path.insert(0, str(UV_SITE_PACKAGES))
-
-def _ensure_ffmpeg():
-    if shutil.which("ffmpeg") is not None:
-        return
-    try:
-        import imageio_ffmpeg
-        exe = imageio_ffmpeg.get_ffmpeg_exe()
-        if exe and os.path.isfile(exe):
-            p = Path(exe).parent
-            alias = p / "ffmpeg.exe"
-            if not alias.exists():
-                try:
-                    shutil.copyfile(exe, alias)
-                except Exception:
-                    pass
-            p_str = str(p)
-            if p_str not in os.environ.get("PATH", ""):
-                os.environ["PATH"] = p_str + os.pathsep + os.environ.get("PATH", "")
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning("Could not auto-configure ffmpeg: %s", e)
-
-_ensure_ffmpeg()
-
-# ── World-Class Hardware Acceleration Engine (GPU-First with CPU Fallback) ──
-def _patch_lama_engine():
-    """Patch ONNX session loader with auto-detect: CUDA GPU -> DirectML GPU -> Multi-Core CPU."""
-    try:
-        from remove_ai_watermarks import region_eraser
-        import onnxruntime as ort
-
-        # Preload Nvidia CUDA / cuDNN runtime DLLs if available on Windows
-        if hasattr(ort, "preload_dlls"):
-            try:
-                ort.preload_dlls()
-            except Exception:
-                pass
-
-        class SafeInferenceSession:
-            """Wrapper around onnxruntime.InferenceSession that automatically falls back to CPU if GPU execution fails."""
-            def __init__(self, model_path, sess_options, providers, label):
-                self.model_path = model_path
-                self.sess_options = sess_options
-                self.providers = list(providers)
-                self.label = label
-                self._session = ort.InferenceSession(model_path, sess_options=sess_options, providers=providers)
-                self.is_cpu = ("CPUExecutionProvider" in providers and len(providers) == 1)
-
-            def run(self, output_names, input_feed, run_options=None):
-                try:
-                    return self._session.run(output_names, input_feed, run_options)
-                except Exception as run_err:
-                    if not self.is_cpu:
-                        import logging
-                        logging.getLogger(__name__).warning(
-                            "GPU session execution notice (%s); seamlessly falling back to CPU for %s...",
-                            run_err, self.label
-                        )
-                        self._session = ort.InferenceSession(
-                            self.model_path,
-                            sess_options=self.sess_options,
-                            providers=["CPUExecutionProvider"],
-                        )
-                        self.is_cpu = True
-                        return self._session.run(output_names, input_feed, run_options)
-                    raise
-
-            def get_inputs(self):
-                return self._session.get_inputs()
-
-            def get_outputs(self):
-                return self._session.get_outputs()
-
-            def get_providers(self):
-                return self._session.get_providers()
-
-            def __getattr__(self, name):
-                return getattr(self._session, name)
-
-        def _find_hf_cached_model(repo_id, filename):
-            """Find model: 1) bundled inside EXE, 2) huggingface cache."""
-            # Priority 1: Bundled inside the EXE (models/ directory)
-            bundled = BUNDLE_DIR / "models" / filename
-            if bundled.exists():
-                return str(bundled)
-            # Priority 2: Huggingface cache on disk
-            cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
-            model_dir = cache_dir / f"models--{repo_id.replace('/', '--')}"
-            if model_dir.exists():
-                snapshots = model_dir / "snapshots"
-                if snapshots.exists():
-                    for snap in sorted(snapshots.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
-                        candidate = snap / filename
-                        if candidate.exists():
-                            return str(candidate)
-            return None
-
-        def _get_session_auto(name, repo_id, filename, label):
-            cached = region_eraser._sessions.get(name)
-            if cached is not None:
-                return cached
-            import logging
-            # Try finding model in huggingface cache first (no import needed)
-            model_path = _find_hf_cached_model(repo_id, filename)
-            if model_path is None:
-                # Model not cached yet - must download (first-time only)
-                try:
-                    from huggingface_hub import hf_hub_download
-                    model_path = hf_hub_download(repo_id=repo_id, filename=filename)
-                except Exception as dl_err:
-                    logging.getLogger(__name__).error(
-                        "❌ Cannot find or download model %s/%s: %s", repo_id, filename, dl_err
-                    )
-                    raise
-
-            so = ort.SessionOptions()
-            so.enable_cpu_mem_arena = True
-            so.execution_mode = ort.ExecutionMode.ORT_PARALLEL
-            so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            threads = max(1, os.cpu_count() or 2)
-            so.intra_op_num_threads = threads
-            so.inter_op_num_threads = threads
-
-            available = ort.get_available_providers()
-            session = None
-
-            # 1. Tier 1: NVIDIA CUDA GPU (Ultra-Fast)
-            if "CUDAExecutionProvider" in available:
-                try:
-                    import numpy as np
-                    cuda_session = SafeInferenceSession(
-                        model_path,
-                        sess_options=so,
-                        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-                        label=label,
-                    )
-                    inp = cuda_session.get_inputs()
-                    dummy = {i.name: np.zeros([1 if isinstance(d, str) else d for d in i.shape], dtype=np.float32) for i in inp}
-                    cuda_session.run(None, dummy)
-                    session = cuda_session
-                    logging.getLogger(__name__).info(
-                        "🚀 [Removix Engine] Accelerated with NVIDIA CUDA GPU: %s", label
-                    )
-                except Exception as gpu_err:
-                    logging.getLogger(__name__).warning(
-                        "CUDA GPU incompatible (%s); trying DirectML/CPU", gpu_err
-                    )
-
-            # 2. Tier 2: DirectML GPU (Works on Intel Iris, AMD Radeon, NVIDIA)
-            if session is None and "DmlExecutionProvider" in available:
-                try:
-                    import numpy as np
-                    dml_session = SafeInferenceSession(
-                        model_path,
-                        sess_options=so,
-                        providers=["DmlExecutionProvider", "CPUExecutionProvider"],
-                        label=label,
-                    )
-                    # Warmup: verify GPU can actually execute this model's ops
-                    inp = dml_session.get_inputs()
-                    dummy = {i.name: np.zeros([1 if isinstance(d, str) else d for d in i.shape], dtype=np.float32) for i in inp}
-                    dml_session.run(None, dummy)
-                    session = dml_session
-                    logging.getLogger(__name__).info(
-                        "⚡ [Removix Engine] Accelerated with DirectML GPU: %s", label
-                    )
-                except Exception as dml_err:
-                    logging.getLogger(__name__).warning(
-                        "DirectML GPU incompatible (%s); using CPU instead", dml_err
-                    )
-
-            # 3. Tier 3: Multi-Core CPU Fallback (Intel / AMD CPU)
-            if session is None:
-                session = SafeInferenceSession(
-                    model_path,
-                    sess_options=so,
-                    providers=["CPUExecutionProvider"],
-                    label=label,
-                )
-                logging.getLogger(__name__).info(
-                    "💻 [Removix Engine] Running on Multi-Core CPU: %s", label
-                )
-
-            region_eraser._sessions[name] = session
-            return session
-
-        region_eraser._get_session = _get_session_auto
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).error("Engine patch failed: %s", e, exc_info=True)
-
-_patch_lama_engine()
-
-# Avoid pre-warming on memory-tight cloud containers (Render 512MB RAM limit)
-if not os.environ.get("RENDER"):
-    def _prewarm_lama():
-        try:
-            from remove_ai_watermarks.region_eraser import _get_lama_session
-            _get_lama_session()
-            import gc
-            gc.collect()
-        except Exception:
-            pass
-
-    threading.Thread(target=_prewarm_lama, daemon=True).start()
-
-CLI = shutil.which("remove-ai-watermarks") or str(
-    Path.home() / ".local" / "bin" / "remove-ai-watermarks.exe"
+# Import UI Views from ui/
+from ui import (
+    render_home_page,
+    render_video_watermark_page,
+    render_image_watermark_page,
+    render_image_to_pdf_page,
+    render_pdf_to_image_page,
+    render_pdf_tools_grid_page,
+    render_merge_pdf_page,
+    render_split_pdf_page,
+    render_rotate_pdf_page,
+    render_delete_pages_page,
+    render_protect_pdf_page,
+    render_unlock_pdf_page,
+    render_word_to_pdf_page,
+    render_edit_pdf_page,
+    render_converter_page,
+    render_qr_page,
+    render_ocr_page,
+    render_bg_remove_page,
+    render_more_tools_page,
+    # Image Tools Hub & Views
+    render_image_tools_grid_page,
+    render_png_to_jpg_page,
+    render_jpg_to_png_page,
+    render_webp_to_jpg_page,
+    render_jpg_to_webp_page,
+    render_png_to_webp_page,
+    render_webp_to_png_page,
+    render_png_to_svg_page,
+    render_jpg_to_svg_page,
+    render_svg_to_png_page,
+    render_jpg_to_gif_page,
+    render_gif_to_jpg_page,
+    render_png_to_gif_page,
+    render_gif_to_png_page,
+    render_jpg_to_tiff_page,
+    render_tiff_to_jpg_page,
+    render_png_to_tiff_page,
+    render_tiff_to_png_page,
+    render_resize_image_page,
+    render_crop_image_page,
+    render_compress_image_page,
+    render_flip_image_page,
+    render_black_white_page,
+    render_add_text_image_page,
+    render_make_round_image_page,
+    render_blur_background_page,
+    render_collage_maker_page,
+    render_upscale_image_page,
+    render_privacy_page,
+    render_faq_page,
+    render_contact_page,
+    render_about_page,
 )
-if not shutil.which("remove-ai-watermarks") and not os.path.isfile(CLI):
-    CLI = "remove-ai-watermarks"
 
-WORKDIR = Path(tempfile.gettempdir()) / "removix_jobs"
-WORKDIR.mkdir(exist_ok=True)
+# Activity Tracker Module
+from modules import activity_tracker
 
-VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".flv"}
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
+# Image Tools Conversion & Utility Modules
+from modules.png_to_jpg import convert_png_to_jpg
+from modules.jpg_to_png import convert_jpg_to_png
+from modules.webp_to_jpg import convert_webp_to_jpg
+from modules.jpg_to_webp import convert_jpg_to_webp
+from modules.png_to_webp import convert_png_to_webp
+from modules.webp_to_png import convert_webp_to_png
+from modules.png_to_svg import convert_png_to_svg
+from modules.jpg_to_svg import convert_jpg_to_svg
+from modules.svg_to_png import convert_svg_to_png
+from modules.jpg_to_gif import convert_jpg_to_gif
+from modules.gif_to_jpg import convert_gif_to_jpg
+from modules.png_to_gif import convert_png_to_gif
+from modules.gif_to_png import convert_gif_to_png
+from modules.jpg_to_tiff import convert_jpg_to_tiff
+from modules.tiff_to_jpg import convert_tiff_to_jpg
+from modules.png_to_tiff import convert_png_to_tiff
+from modules.tiff_to_png import convert_tiff_to_png
+from modules.resize_image import resize_image
+from modules.crop_image import crop_image
+from modules.compress_image import compress_image
+from modules.flip_image import flip_image
+from modules.black_white import convert_black_white
+from modules.add_text_image import add_text_to_image
+from modules.make_round_image import make_round_image
+from modules.blur_background import blur_background
+from modules.collage_maker import make_collage
+from modules.upscale_image import upscale_image
 
-FRAME_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
-PCT_RE = re.compile(r"(\d{1,3})\s*%")
-
-JOBS = {}
-JOBS_LOCK = threading.Lock()
 
 app = Flask(__name__)
-
-
-def set_job(job_id, **kwargs):
-    with JOBS_LOCK:
-        if job_id in JOBS:
-            JOBS[job_id].update(kwargs)
-
-
-def sanitize_error_message(raw_msg: str, is_video: bool = False) -> str:
-    """Sanitize internal errors so tool names, version numbers, or package internals never leak to UI."""
-    if not raw_msg:
-        return "Could not complete media processing. Please try again with a valid file."
-    
-    clean_lines = []
-    for line in raw_msg.splitlines():
-        line_clean = line.strip()
-        # Filter out internal CLI banners and version numbers
-        if any(b in line_clean.lower() for b in ["remove-ai-watermarks", "v0.", "visible & invisible", "cleaning input."]):
-            continue
-        if "requires" in line_clean.lower() or "not found" in line_clean.lower():
-            continue
-        if line_clean:
-            clean_lines.append(line_clean)
-            
-    filtered = " ".join(clean_lines).strip()
-    if not filtered or len(filtered) < 6:
-        if is_video:
-            return "Unable to process video file. Please ensure it is a valid, supported video format (MP4, MOV, WebM) and try again."
-        return "Unable to process image file. Please ensure the image is a valid format (PNG, JPG, WebP) and try again."
-    
-    # Strip any remaining technical words
-    filtered = re.sub(r'remove[-_]ai[-_]watermarks(\[[^\]]*\])?', 'restoration engine', filtered, flags=re.I)
-    filtered = re.sub(r'v\d+\.\d+(\.\d+)?', '', filtered, flags=re.I)
-    filtered = re.sub(r'\b(lama|migan|opencv|cv2|onnxruntime|c2pa)\b', 'AI component', filtered, flags=re.I)
-    return filtered
-
-
-def process_image_direct(job_id, in_path, out_path, custom_box=None, corner_mode=None):
-    import cv2
-    import numpy as np
-    from remove_ai_watermarks.api import remove_visible_detailed
-
-    set_job(job_id, stage="scanning", percent=10, message="Analyzing image and AI provenance...")
-    time.sleep(0.12)
-    set_job(job_id, stage="scanning", percent=25, message="Detecting watermark coordinates...")
-    time.sleep(0.12)
-    set_job(job_id, stage="removing", percent=35, message="Reconstructing background with AI...")
-
-    result_container = {"report": None, "error": None}
-
-    def run_worker():
-        try:
-            from remove_ai_watermarks import watermark_registry
-            from remove_ai_watermarks.api import _load_visible_input, _write_visible_result
-            from remove_ai_watermarks import region_eraser
-
-            loaded = _load_visible_input(in_path)
-            h, w = loaded.bgr.shape[:2]
-
-            report = None
-            if custom_box and len(custom_box) == 4:
-                cb_x, cb_y, cb_w, cb_h = custom_box
-                cleaned = region_eraser.erase(loaded.bgr, boxes=[(cb_x, cb_y, cb_w, cb_h)], backend="lama")
-                class CustomReport:
-                    labels = ["Custom selected watermark"]
-                    image = cleaned
-                report = CustomReport()
-            elif corner_mode == "bottom-left":
-                bl_w = min(int(w * 0.18), 240)
-                bl_h = min(int(h * 0.09), 90)
-                margin_x = max(8, int(w * 0.012))
-                margin_y = max(8, int(h * 0.012))
-                cleaned = region_eraser.erase(loaded.bgr, boxes=[(margin_x, h - bl_h - margin_y, bl_w, bl_h)], backend="lama")
-                class BLReport:
-                    labels = ["Bottom-Left watermark"]
-                    image = cleaned
-                report = BLReport()
-            elif corner_mode == "bottom-right":
-                br_w = min(int(w * 0.18), 240)
-                br_h = min(int(h * 0.09), 90)
-                margin_x = max(8, int(w * 0.012))
-                margin_y = max(8, int(h * 0.012))
-                cleaned = region_eraser.erase(loaded.bgr, boxes=[(w - br_w - margin_x, h - br_h - margin_y, br_w, br_h)], backend="lama")
-                class BRReport:
-                    labels = ["Bottom-Right watermark"]
-                    image = cleaned
-                report = BRReport()
-            else:
-                # Use confirmed trust level so marks are recognized even on images without EXIF/metadata
-                provenance = loaded.provenance or frozenset(watermark_registry.mark_keys())
-                report = watermark_registry.remove_auto_marks_detailed(
-                    loaded.bgr,
-                    sensitivity="auto",
-                    provenance=provenance,
-                    backend="lama",
-                )
-
-                # Relaxed Gemini sparkle check
-                if not report.labels:
-                    from remove_ai_watermarks.gemini_engine import GeminiEngine
-                    engine = GeminiEngine()
-                    det = engine.detect_watermark(loaded.bgr, trust_provenance=True)
-                    if not det.detected and getattr(det, "spatial_score", 0.0) >= 0.20:
-                        det.detected = True
-                        if not det.region:
-                            det.region = (w - 72, h - 72, 48, 48)
-
-                    if det.detected:
-                        rx, ry, rw, rh = det.region
-                        cleaned = region_eraser.erase(loaded.bgr, boxes=[(rx, ry, rw, rh)], backend="lama")
-                        class FallbackReport:
-                            labels = ["Google Gemini visible watermark (sparkle)"]
-                            image = cleaned
-                        report = FallbackReport()
-
-                # If still no mark detected, perform Universal AI Watermark Corner Inpaint
-                if not report.labels:
-                    from remove_ai_watermarks.gemini_engine import GeminiEngine
-                    engine = GeminiEngine()
-                    sparkle_mask = engine.footprint_mask(loaded.bgr, force=True)
-                    cleaned = None
-
-                    # If official Gemini sparkle mask builds, try erasing with LaMa
-                    if sparkle_mask is not None and sparkle_mask.any():
-                        try:
-                            cleaned = region_eraser.erase_lama(loaded.bgr, sparkle_mask)
-                        except Exception:
-                            cleaned = None
-
-                    # Fallback to standard bottom-right AI watermark box
-                    if cleaned is None:
-                        br_w = min(int(w * 0.18), 240)
-                        br_h = min(int(h * 0.09), 90)
-                        margin_x = max(8, int(w * 0.012))
-                        margin_y = max(8, int(h * 0.012))
-                        rx = w - br_w - margin_x
-                        ry = h - br_h - margin_y
-                        cleaned = region_eraser.erase(loaded.bgr, boxes=[(rx, ry, br_w, br_h)], backend="lama")
-
-                    class UniversalReport:
-                        labels = ["AI Watermark (Universal Clean)"]
-                        image = cleaned
-                    report = UniversalReport()
-
-            _write_visible_result(
-                loaded,
-                report.image,
-                report.labels,
-                out_path,
-                strip_metadata=True,
-                write_noop=True,
-            )
-            job_dir = out_path.parent
-            if not out_path.exists() and report.image is not None:
-                cv2.imwrite(str(out_path), report.image)
-            if report.image is not None:
-                try:
-                    cv2.imwrite(str(job_dir / "preview_output.jpg"), report.image)
-                except Exception:
-                    pass
-            if loaded.bgr is not None:
-                try:
-                    cv2.imwrite(str(job_dir / "preview_input.jpg"), loaded.bgr)
-                except Exception:
-                    pass
-            result_container["report"] = report
-        except Exception as e:
-            result_container["error"] = e
-        finally:
-            import gc
-            gc.collect()
-
-    worker_thread = threading.Thread(target=run_worker, daemon=True)
-    worker_thread.start()
-
-    current_pct = 35
-    elapsed_ticks = 0
-    while worker_thread.is_alive():
-        worker_thread.join(timeout=0.4)
-        if not worker_thread.is_alive():
-            break
-        elapsed_ticks += 1
-        # Strictly increasing monotonic progression:
-        if current_pct < 60:
-            if elapsed_ticks % 2 == 0:
-                current_pct += 1
-            msg = "Isolating watermark context & creating neural tensor..."
-        elif current_pct < 80:
-            if elapsed_ticks % 2 == 0:
-                current_pct += 1
-            msg = "Reconstructing background with LaMa Neural Network..."
-        elif current_pct < 92:
-            if elapsed_ticks % 3 == 0:
-                current_pct += 1
-            msg = "Synthesizing seamless textures & removing AI footprint..."
-        elif current_pct < 98:
-            if elapsed_ticks % 5 == 0:
-                current_pct += 1
-            msg = "Harmonizing color gradients & edge feathering..."
-        else:
-            msg = "Finalizing photorealistic pixel blend..."
-
-        set_job(job_id, stage="removing", percent=current_pct, message=msg)
-
-    if result_container["error"] is not None:
-        raise result_container["error"]
-
-    set_job(job_id, stage="finalizing", percent=98, message="Validating seamless restoration & stripping tags...")
-    time.sleep(0.12)
-    set_job(job_id, stage="done", percent=100, message="Restoration complete")
-
-
-def process_video_direct(job_id, in_path, out_path, custom_box=None, corner_mode=None):
-    import cv2
-    import numpy as np
-    from dataclasses import replace
-    from remove_ai_watermarks.video import (
-        VIDEO_VISIBLE_MARKS,
-        _select_stable_visible_mark,
-    )
-    from remove_ai_watermarks.video_visible import (
-        detect_sora_frame,
-        detect_veo_frame,
-        detect_seedance_frame,
-        detect_doubao_frame,
-        detect_dola_frame,
-        detect_hailuo_frame,
-        detect_kling_frame,
-        _prepare_frame,
-        probe_video_timestamps,
-        probe_video_encode_profile,
-        _timestamp_time_base,
-        _timestamps_are_variable,
-        start_raw_video_encoder,
-        raw_video_command,
-        _mask_for_region,
-        stabilize_filled_frame,
-        finish_raw_video_encoder,
-        _TimestampedNutWriter,
-        staged_video_output,
-        VideoScan,
-    )
-    from remove_ai_watermarks.video_temporal import _backward_map, _backward_warp
-    from remove_ai_watermarks.video_encoding import mux_encoded_video
-    from remove_ai_watermarks.metadata import get_ai_metadata, strip_and_verify
-    from remove_ai_watermarks.watermark_registry import fill, resolve_backend
-
-    def _temporal_lama_inpaint(
-        f_idx,
-        source_frame,
-        mask,
-        prev_source,
-        prev_cleaned,
-        prev_mask,
-        backend,
-        keyframe_interval=4,
-    ):
-        if mask is None or not np.any(mask > 0):
-            return source_frame
-
-        # Always run full LaMa neural network on keyframes or when prior frame is unavailable
-        is_keyframe = (f_idx % keyframe_interval == 0) or prev_cleaned is None or prev_mask is None
-        if is_keyframe:
-            cleaned = fill(source_frame, mask, backend=backend)
-            if prev_source is not None and prev_cleaned is not None and prev_mask is not None:
-                cleaned = stabilize_filled_frame(
-                    prev_source,
-                    prev_cleaned,
-                    prev_mask,
-                    source_frame,
-                    cleaned,
-                    mask,
-                    copy=False,
-                )
-            return cleaned
-
-        # Intermediate frames: propagate previous clean pixels using localized optical flow
-        union = (prev_mask > 0) | (mask > 0)
-        ys, xs = np.where(union)
-        if len(xs) == 0:
-            return source_frame.copy()
-
-        h, w = mask.shape
-        m_w = int(xs.max() - xs.min() + 1)
-        m_h = int(ys.max() - ys.min() + 1)
-        pad = max(24, round(max(m_w, m_h) * 0.75))
-        x0 = max(0, int(xs.min()) - pad)
-        y0 = max(0, int(ys.min()) - pad)
-        x1 = min(w, int(xs.max()) + pad + 1)
-        y1 = min(h, int(ys.max()) + pad + 1)
-
-        prev_src_crop = prev_source[y0:y1, x0:x1]
-        curr_src_crop = source_frame[y0:y1, x0:x1]
-        prev_cln_crop = prev_cleaned[y0:y1, x0:x1]
-        prev_msk_crop = prev_mask[y0:y1, x0:x1]
-        curr_msk_crop = mask[y0:y1, x0:x1]
-
-        try:
-            maps = _backward_map(
-                cv2.cvtColor(curr_src_crop, cv2.COLOR_BGR2GRAY),
-                cv2.cvtColor(prev_src_crop, cv2.COLOR_BGR2GRAY),
-            )
-            warped_prev_src = _backward_warp(prev_src_crop, maps)
-            warped_prev_cln = _backward_warp(prev_cln_crop, maps)
-            warped_prev_msk = _backward_warp(
-                prev_msk_crop,
-                maps,
-                interpolation=cv2.INTER_NEAREST,
-            )
-
-            curr_hole = curr_msk_crop > 0
-            covered = curr_hole & (warped_prev_msk > 0)
-
-            if np.any(curr_hole) and float(np.mean(covered[curr_hole])) >= 0.85:
-                occupied = curr_hole | (warped_prev_msk > 0)
-                dilation = max(7, round(max(m_w, m_h) * 0.25))
-                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilation | 1, dilation | 1))
-                context = cv2.dilate(occupied.astype(np.uint8), kernel).astype(bool) & ~occupied
-                if np.count_nonzero(context) >= 64:
-                    residual = np.abs(curr_src_crop.astype(np.float32) - warped_prev_src.astype(np.float32))
-                    context_residual = float(np.mean(residual[context]))
-                    if context_residual <= 14.0:
-                        # Smooth background motion: warp prior LaMa fill seamlessly
-                        result = source_frame.copy()
-                        result_crop = result[y0:y1, x0:x1]
-                        feather = cv2.GaussianBlur(curr_hole.astype(np.float32), (5, 5), 1.0)[..., None]
-                        blended = (1.0 - feather) * result_crop.astype(np.float32) + feather * warped_prev_cln.astype(np.float32)
-                        result_crop[curr_hole] = np.clip(blended[curr_hole], 0, 255).astype(np.uint8)
-                        return result
-        except Exception:
-            pass
-
-        # Sudden motion or scene cut: run full LaMa neural network
-        cleaned = fill(source_frame, mask, backend=backend)
-        if prev_source is not None and prev_cleaned is not None and prev_mask is not None:
-            cleaned = stabilize_filled_frame(
-                prev_source,
-                prev_cleaned,
-                prev_mask,
-                source_frame,
-                cleaned,
-                mask,
-                copy=False,
-            )
-        return cleaned
-
-    source_path = Path(in_path)
-    output_path = Path(out_path)
-
-    set_job(job_id, stage="scanning", percent=5, message="Scanning video metadata...")
-    detected_metadata = get_ai_metadata(source_path)
-
-    detectors = {
-        "sora": detect_sora_frame,
-        "veo": detect_veo_frame,
-        "seedance": detect_seedance_frame,
-        "doubao": detect_doubao_frame,
-        "dola": detect_dola_frame,
-        "hailuo": detect_hailuo_frame,
-        "kling": detect_kling_frame,
-    }
-
-    job_dir = source_path.parent
-    capture = cv2.VideoCapture(str(source_path))
-    if not capture.isOpened():
-        raise RuntimeError(f"Could not open video file: {source_path}")
-
-    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = float(capture.get(cv2.CAP_PROP_FPS)) or 24.0
-    total_est_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-
-    # Extract frame 0 for preview
-    ok0, frame0 = capture.read()
-    if ok0 and frame0 is not None:
-        try:
-            cv2.imwrite(str(job_dir / "preview_input.jpg"), frame0)
-        except Exception:
-            pass
-
-    # Read authoritative timestamps
-    probed = probe_video_timestamps(source_path)
-    total_frames = len(probed) if len(probed) > 0 else total_est_frames
-    shared_timestamps = probed if len(probed) > 0 else tuple(float(i) / max(1.0, fps) for i in range(total_frames))
-
-    selected = None
-    if custom_box and len(custom_box) == 4:
-        capture.release()
-        cb_x, cb_y, cb_w, cb_h = custom_box
-        regions = [(cb_x, cb_y, cb_w, cb_h)] * total_frames
-        scan = VideoScan(width, height, fps, (), shared_timestamps)
-        selected = ("custom_box", scan, regions, 0.04, "box")
-    elif corner_mode == "bottom-left":
-        capture.release()
-        wm_w = max(160, min(int(width * 0.20), 320))
-        wm_h = max(50, min(int(height * 0.085), 110))
-        margin_x = max(10, int(width * 0.015))
-        margin_y = max(10, int(height * 0.015))
-        regions = [(margin_x, height - wm_h - margin_y, wm_w, wm_h)] * total_frames
-        scan = VideoScan(width, height, fps, (), shared_timestamps)
-        selected = ("bottom_left", scan, regions, 0.04, "box")
-    elif corner_mode == "bottom-right":
-        capture.release()
-        wm_w = max(160, min(int(width * 0.20), 320))
-        wm_h = max(50, min(int(height * 0.085), 110))
-        margin_x = max(10, int(width * 0.015))
-        margin_y = max(10, int(height * 0.015))
-        regions = [(width - wm_w - margin_x, height - wm_h - margin_y, wm_w, wm_h)] * total_frames
-        scan = VideoScan(width, height, fps, (), shared_timestamps)
-        selected = ("bottom_right", scan, regions, 0.04, "box")
-    else:
-        # Smart Fast-Scan (20-30 frames window as requested)
-        max_scan_frames = min(30, total_est_frames)
-        scan_frames = [(0, frame0)] if (ok0 and frame0 is not None) else []
-        for f_idx in range(1, max_scan_frames):
-            ok, f = capture.read()
-            if not ok:
-                break
-            scan_frames.append((f_idx, f))
-
-        detections = {mark: [] for mark in detectors}
-        confirmed_mark = None
-        for f_idx, f in scan_frames:
-            prepared = _prepare_frame(f)
-            for mark, detector in detectors.items():
-                det = detector(f, frame_index=f_idx, prepared=prepared)
-                detections[mark].append(det)
-                if getattr(det, "box", None) is not None:
-                    pos_count = sum(1 for d in detections[mark] if getattr(d, "box", None) is not None)
-                    if pos_count >= 2:
-                        confirmed_mark = mark
-            pct = 5 + int((f_idx / max_scan_frames) * 18)
-            set_job(job_id, stage="scanning", percent=pct, message=f"Scanning frame {f_idx + 1}/{max_scan_frames} for AI watermarks...")
-            if confirmed_mark and f_idx >= 15:
-                break
-
-        # If not found yet and video has many frames, check 2 sample frames at 50% and 80%
-        if not confirmed_mark and total_est_frames > 60:
-            for s_pct in (0.50, 0.80):
-                s_idx = int(total_est_frames * s_pct)
-                capture.set(cv2.CAP_PROP_POS_FRAMES, s_idx)
-                s_ok, s_frame = capture.read()
-                if s_ok and s_frame is not None:
-                    prepared = _prepare_frame(s_frame)
-                    for mark, detector in detectors.items():
-                        det = detector(s_frame, frame_index=s_idx, prepared=prepared)
-                        detections[mark].append(det)
-                        if getattr(det, "box", None) is not None:
-                            confirmed_mark = mark
-                            break
-                if confirmed_mark:
-                    break
-
-        capture.release()
-
-        # Build scans for detector verification
-        scans = {
-            mark: VideoScan(width, height, fps, tuple(detections[mark]), shared_timestamps[:len(detections[mark])])
-            for mark in detectors
-        }
-        set_job(job_id, stage="scanning", percent=25, message="Locking watermark coordinates...")
-        selected_candidate = _select_stable_visible_mark(scans, detected_metadata, VIDEO_VISIBLE_MARKS)
-        if selected_candidate is not None:
-            c_mark, c_scan, c_regions, c_pad, c_style = selected_candidate
-            found_box = next((r for r in c_regions if r is not None), None)
-            if found_box is not None:
-                regions = [found_box] * total_frames
-                scan = VideoScan(width, height, fps, (), shared_timestamps)
-                selected = (c_mark, scan, regions, c_pad, c_style)
-
-        if selected is None:
-            # Universal AI Video Watermark Fallback (Runway, Luma, Pika, Kling, etc.)
-            wm_w = max(160, min(int(width * 0.20), 320))
-            wm_h = max(50, min(int(height * 0.085), 110))
-            margin_x = max(10, int(width * 0.015))
-            margin_y = max(10, int(height * 0.015))
-            box_x = width - wm_w - margin_x
-            box_y = height - wm_h - margin_y
-            regions = [(box_x, box_y, wm_w, wm_h)] * total_frames
-            scan = VideoScan(width, height, fps, (), shared_timestamps)
-            selected = ("universal_ai_corner", scan, regions, 0.04, "box")
-
-    mark, scan, regions, padding_fraction, mask_style = selected
-    resolved_backend = resolve_backend("lama")
-
-    set_job(job_id, stage="removing", percent=26, message=f"Restoring frame 1/{total_frames} with AI...")
-
-    with staged_video_output(output_path) as (encoded_video, temporary_output):
-        profile = probe_video_encode_profile(source_path)
-        time_base = _timestamp_time_base(profile.time_base)
-        preserve_start_offset = profile.start_pts not in (None, 0)
-        timestamped_input = preserve_start_offset or _timestamps_are_variable(scan, time_base=time_base)
-        if timestamped_input and profile.time_base is None:
-            profile = replace(
-                profile,
-                time_base=f"{time_base.numerator}/{time_base.denominator}",
-            )
-
-        process = start_raw_video_encoder(
-            raw_video_command(
-                encoded_video,
-                width=scan.width,
-                height=scan.height,
-                fps=scan.fps,
-                crf=14,
-                profile=profile,
-                timestamped_input=timestamped_input,
-                copy_input_timestamps=preserve_start_offset,
-            )
-        )
-        frame_pipe = process.stdin
-        capture = cv2.VideoCapture(str(source_path))
-        timestamped_writer = None
-        if timestamped_input:
-            timestamped_writer = _TimestampedNutWriter(
-                frame_pipe,
-                width=scan.width,
-                height=scan.height,
-                time_base=time_base,
-                start_pts=profile.start_pts or 0,
-            )
-
-        previous_source = None
-        previous_cleaned = None
-        previous_mask = None
-
-        try:
-            KEYFRAME_INTERVAL = 4
-            for f_idx, region in enumerate(regions):
-                ok, frame = capture.read()
-                if not ok:
-                    break
-                source_frame = frame
-                mask = None
-                if region is not None:
-                    mask = _mask_for_region(
-                        frame,
-                        region,
-                        padding_fraction=padding_fraction,
-                        mask_style=mask_style,
-                    )
-                    frame = _temporal_lama_inpaint(
-                        f_idx,
-                        source_frame,
-                        mask,
-                        previous_source,
-                        previous_cleaned,
-                        previous_mask,
-                        resolved_backend,
-                        keyframe_interval=KEYFRAME_INTERVAL,
-                    )
-
-                if f_idx == 0 or not (job_dir / "preview_output.jpg").exists():
-                    try:
-                        cv2.imwrite(str(job_dir / "preview_output.jpg"), frame)
-                    except Exception:
-                        pass
-
-                if timestamped_writer is None:
-                    frame_pipe.write(frame.tobytes())
-                else:
-                    timestamped_writer.write(frame, scan.timestamps[f_idx])
-
-                previous_source = source_frame
-                previous_cleaned = frame
-                previous_mask = mask
-
-                pct = 25 + int(((f_idx + 1) / total_frames) * 65)
-                set_job(job_id, stage="removing", percent=pct, message=f"Restoring frame {f_idx + 1}/{total_frames} with AI...")
-
-            if timestamped_writer is not None:
-                timestamped_writer.close()
-                timestamped_writer = None
-
-            set_job(job_id, stage="finalizing", percent=92, message="Finalizing video encoding...")
-            finish_raw_video_encoder(process, encoded_video, operation="visible-watermark encode")
-            set_job(job_id, stage="finalizing", percent=96, message="Muxing lossless audio & stripping tags...")
-            mux_encoded_video(
-                encoded_video,
-                source_path,
-                temporary_output,
-                strip_metadata=True,
-                copy_input_timestamps=preserve_start_offset,
-            )
-        finally:
-            capture.release()
-            if timestamped_writer is not None:
-                try:
-                    timestamped_writer.close()
-                except Exception:
-                    pass
-
-    set_job(job_id, stage="done", percent=100, message="Restoration complete")
-
-
-def run_job_cli_fallback(job_id, in_path, out_path, ext):
-    if ext in VIDEO_EXTS:
-        cmd = [CLI, "video", "all", "--backend", "lama", str(in_path), "-o", str(out_path)]
-    else:
-        cmd = [CLI, "visible", "--backend", "lama", str(in_path), "-o", str(out_path)]
-
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1,
-    )
-    set_job(job_id, stage="removing", percent=25, message="Intelligent background reconstruction in progress...")
-
-    stop_ticker = threading.Event()
-    def ticker():
-        curr = 25
-        ticks = 0
-        while not stop_ticker.is_set():
-            stop_ticker.wait(0.5)
-            if stop_ticker.is_set():
-                break
-            ticks += 1
-            if curr < 65:
-                curr += 1
-            elif curr < 85:
-                if ticks % 2 == 0:
-                    curr += 1
-            elif curr < 98:
-                if ticks % 4 == 0:
-                    curr += 1
-            set_job(job_id, percent=curr)
-    
-    t_tick = threading.Thread(target=ticker, daemon=True)
-    t_tick.start()
-
-    last_lines = []
-    try:
-        for line in proc.stdout:
-            last_lines.append(line.strip())
-            last_lines = last_lines[-15:]
-            m = FRAME_RE.search(line)
-            if m:
-                done, total = int(m.group(1)), int(m.group(2))
-                if total > 0:
-                    pct = 25 + round((done / total) * 65)
-                    set_job(job_id, percent=min(pct, 92), stage="removing", message=f"Restoring frame {done}/{total} with AI...")
-                    continue
-            m = PCT_RE.search(line)
-            if m:
-                set_job(job_id, percent=min(int(m.group(1)), 90), stage="removing")
-    finally:
-        stop_ticker.set()
-        t_tick.join(timeout=1.0)
-
-    proc.wait()
-    set_job(job_id, stage="finalizing", percent=95, message="Finalizing clean output...")
-
-    if proc.returncode != 0 or not out_path.exists():
-        raw_err = "\n".join(last_lines[-5:]) or "Processing failed"
-        set_job(job_id, stage="error", error=sanitize_error_message(raw_err, is_video=(ext in VIDEO_EXTS)))
-        return
-
-    set_job(job_id, stage="done", percent=100, message="Restoration complete")
-
-
-def run_job(job_id, in_path, out_path, ext, custom_box=None, corner_mode=None):
-    set_job(job_id, stage="scanning", percent=5, message="Scanning media and analyzing coordinates...")
-    try:
-        if ext in VIDEO_EXTS:
-            try:
-                process_video_direct(job_id, in_path, out_path, custom_box=custom_box, corner_mode=corner_mode)
-            except Exception as direct_err:
-                import logging
-                logging.getLogger(__name__).warning("Direct video processing failed: %s, trying CLI fallback", direct_err)
-                try:
-                    run_job_cli_fallback(job_id, in_path, out_path, ext)
-                except FileNotFoundError:
-                    raise direct_err  # Re-raise original error if CLI also missing
-        elif ext in IMAGE_EXTS:
-            try:
-                process_image_direct(job_id, in_path, out_path, custom_box=custom_box, corner_mode=corner_mode)
-            except Exception as direct_err:
-                import logging
-                logging.getLogger(__name__).warning("Direct image processing failed: %s, trying CLI fallback", direct_err)
-                try:
-                    run_job_cli_fallback(job_id, in_path, out_path, ext)
-                except FileNotFoundError:
-                    raise direct_err  # Re-raise original error if CLI also missing
-        else:
-            set_job(job_id, stage="error", error=f"Unsupported file type: {ext}")
-            return
-    except Exception as exc:
-        set_job(job_id, stage="error", error=sanitize_error_message(str(exc), is_video=(ext in VIDEO_EXTS)))
 
 
 @app.after_request
@@ -994,9 +171,306 @@ def add_no_cache_headers(response):
     return response
 
 
+# =====================================================================
+# 1. PAGE ROUTING (All views rendered from ui/)
+# =====================================================================
+
 @app.route("/")
-def home():
-    return PAGE
+@app.route("/home")
+@app.route("/history")
+def page_home():
+    """Removix Redesigned Home Page View"""
+    return render_home_page()
+
+
+@app.route("/video-watermark")
+@app.route("/video-tools")
+def page_video_watermark():
+    """Video Watermark Removal View"""
+    return render_video_watermark_page()
+
+
+@app.route("/image-watermark")
+def page_image_watermark():
+    """Image Watermark Removal View"""
+    return render_image_watermark_page()
+
+
+@app.route("/pdf-tools")
+def page_pdf_tools():
+    """PDF Tools Hub View"""
+    return render_pdf_tools_grid_page()
+
+
+@app.route("/image-to-pdf")
+def page_image_to_pdf():
+    """Image to PDF Converter View"""
+    return render_image_to_pdf_page()
+
+
+@app.route("/pdf-to-image")
+def page_pdf_to_image():
+    """PDF to Image Converter View"""
+    return render_pdf_to_image_page()
+
+
+@app.route("/merge-pdf")
+def page_merge_pdf():
+    """Merge PDF View"""
+    return render_merge_pdf_page()
+
+
+@app.route("/split-pdf")
+def page_split_pdf():
+    """Split PDF View"""
+    return render_split_pdf_page()
+
+
+@app.route("/rotate-pdf")
+def page_rotate_pdf():
+    """Rotate PDF View"""
+    return render_rotate_pdf_page()
+
+
+@app.route("/delete-pages")
+def page_delete_pages():
+    """Delete PDF Pages View"""
+    return render_delete_pages_page()
+
+
+@app.route("/protect-pdf")
+def page_protect_pdf():
+    """Protect PDF View"""
+    return render_protect_pdf_page()
+
+
+@app.route("/unlock-pdf")
+def page_unlock_pdf():
+    """Unlock PDF View"""
+    return render_unlock_pdf_page()
+
+
+@app.route("/word-to-pdf")
+def page_word_to_pdf():
+    """Word to PDF View"""
+    return render_word_to_pdf_page()
+
+
+@app.route("/edit-pdf")
+def page_edit_pdf():
+    """Edit PDF View"""
+    return render_edit_pdf_page()
+
+
+@app.route("/format-convert")
+def page_format_converter():
+    """Universal Format Converter View"""
+    return render_converter_page()
+
+
+@app.route("/qr-code")
+@app.route("/qr-generator")
+def page_qr():
+    """Instant QR Code Generator View"""
+    return render_qr_page()
+
+
+@app.route("/image-to-text")
+@app.route("/ocr")
+def page_ocr():
+    """Image to Text (OCR) View"""
+    return render_ocr_page()
+
+
+@app.route("/bg-remove")
+@app.route("/background-remove")
+def page_bg_remove():
+    """AI Background Remover View"""
+    return render_bg_remove_page()
+
+
+@app.route("/more-tools")
+@app.route("/more")
+def page_more_tools():
+    """More Tools Hub View (OCR & QR Code)"""
+    return render_more_tools_page()
+
+
+# =====================================================================
+# Company & Info Pages (Working Footer Links)
+# =====================================================================
+
+@app.route("/privacy")
+@app.route("/privacy-policy")
+def page_privacy():
+    """Privacy Policy View"""
+    return render_privacy_page()
+
+
+@app.route("/faq")
+def page_faq():
+    """Frequently Asked Questions View"""
+    return render_faq_page()
+
+
+@app.route("/contact")
+def page_contact():
+    """Contact Us View"""
+    return render_contact_page()
+
+
+@app.route("/about")
+def page_about():
+    """About Removix View"""
+    return render_about_page()
+
+
+# =====================================================================
+# Image Tools Hub & Views
+# =====================================================================
+
+@app.route("/image-tools")
+def page_image_tools():
+    """Image Tools Hub Grid View"""
+    return render_image_tools_grid_page()
+
+
+# 17 Format Converter Pages
+@app.route("/png-to-jpg")
+def page_png_to_jpg():
+    return render_png_to_jpg_page()
+
+
+@app.route("/jpg-to-png")
+def page_jpg_to_png():
+    return render_jpg_to_png_page()
+
+
+@app.route("/webp-to-jpg")
+def page_webp_to_jpg():
+    return render_webp_to_jpg_page()
+
+
+@app.route("/jpg-to-webp")
+def page_jpg_to_webp():
+    return render_jpg_to_webp_page()
+
+
+@app.route("/png-to-webp")
+def page_png_to_webp():
+    return render_png_to_webp_page()
+
+
+@app.route("/webp-to-png")
+def page_webp_to_png():
+    return render_webp_to_png_page()
+
+
+@app.route("/png-to-svg")
+def page_png_to_svg():
+    return render_png_to_svg_page()
+
+
+@app.route("/jpg-to-svg")
+def page_jpg_to_svg():
+    return render_jpg_to_svg_page()
+
+
+@app.route("/svg-to-png")
+def page_svg_to_png():
+    return render_svg_to_png_page()
+
+
+@app.route("/jpg-to-gif")
+def page_jpg_to_gif():
+    return render_jpg_to_gif_page()
+
+
+@app.route("/gif-to-jpg")
+def page_gif_to_jpg():
+    return render_gif_to_jpg_page()
+
+
+@app.route("/png-to-gif")
+def page_png_to_gif():
+    return render_png_to_gif_page()
+
+
+@app.route("/gif-to-png")
+def page_gif_to_png():
+    return render_gif_to_png_page()
+
+
+@app.route("/jpg-to-tiff")
+def page_jpg_to_tiff():
+    return render_jpg_to_tiff_page()
+
+
+@app.route("/tiff-to-jpg")
+def page_tiff_to_jpg():
+    return render_tiff_to_jpg_page()
+
+
+@app.route("/png-to-tiff")
+def page_png_to_tiff():
+    return render_png_to_tiff_page()
+
+
+@app.route("/tiff-to-png")
+def page_tiff_to_png():
+    return render_tiff_to_png_page()
+
+
+# 10 Custom Image Tool Pages
+@app.route("/resize-image")
+def page_resize_image():
+    return render_resize_image_page()
+
+
+@app.route("/crop-image")
+def page_crop_image():
+    return render_crop_image_page()
+
+
+@app.route("/compress-image")
+def page_compress_image():
+    return render_compress_image_page()
+
+
+@app.route("/flip-image")
+def page_flip_image():
+    return render_flip_image_page()
+
+
+@app.route("/black-white")
+def page_black_white():
+    return render_black_white_page()
+
+
+@app.route("/add-text-image")
+def page_add_text_image():
+    return render_add_text_image_page()
+
+
+@app.route("/make-round-image")
+def page_make_round_image():
+    return render_make_round_image_page()
+
+
+@app.route("/blur-background")
+def page_blur_background():
+    return render_blur_background_page()
+
+
+@app.route("/collage-maker")
+def page_collage_maker():
+    return render_collage_maker_page()
+
+
+@app.route("/upscale-image")
+def page_upscale_image():
+    return render_upscale_image_page()
+
 
 
 @app.route("/health")
@@ -1005,26 +479,11 @@ def health():
     return jsonify({"status": "ok", "service": "removix", "timestamp": time.time()})
 
 
-def _render_keep_alive():
-    """Background keep-alive thread: keeps Render free tier awake by pinging itself every 9 minutes."""
-    if not os.environ.get("RENDER"):
-        return
-    import urllib.request
-    time.sleep(45)  # Wait 45s after startup
-    url = os.environ.get("KEEP_ALIVE_URL", "https://removix.sanvox.in/health")
-    while True:
-        try:
-            time.sleep(540)  # 9 minutes (< 15 min Render idle timeout)
-            req = urllib.request.Request(url, headers={"User-Agent": "Removix-SelfPinger/1.0"})
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                pass
-        except Exception:
-            pass
+# =====================================================================
+# 2. WATERMARK REMOVAL API ENDPOINTS (modules.watermark_engine)
+# =====================================================================
 
-
-threading.Thread(target=_render_keep_alive, daemon=True).start()
-
-
+@app.route("/upload", methods=["POST"])
 @app.route("/api/upload", methods=["POST"])
 def upload():
     if "file" not in request.files or not request.files["file"].filename:
@@ -1042,7 +501,6 @@ def upload():
     out_path = job_dir / f"clean{ext}"
     f.save(in_path)
 
-    # Optional custom box coordinates from request (e.g. "x,y,w,h")
     custom_box = None
     box_str = request.form.get("box", "").strip()
     if box_str:
@@ -1112,6 +570,7 @@ def status(job_id):
     })
 
 
+@app.route("/stream/<job_id>")
 @app.route("/api/stream/<job_id>")
 def stream(job_id):
     def event_stream():
@@ -1173,6 +632,7 @@ def stream(job_id):
     )
 
 
+@app.route("/preview/<job_id>/<which>")
 @app.route("/api/preview/<job_id>/<which>")
 def preview(job_id, which):
     with JOBS_LOCK:
@@ -1183,84 +643,33 @@ def preview(job_id, which):
 
     target_file = None
     if which == "output":
-        # 1. Preview jpg first (super fast and 100% universal across browsers)
         cand = job_dir / "preview_output.jpg"
         if cand.exists() and cand.stat().st_size > 0:
             target_file = cand
-        # 2. In-memory job out_path if it's an image
         if target_file is None and job and job.get("out_path"):
             cand = Path(job["out_path"])
             if cand.exists() and cand.stat().st_size > 0 and cand.suffix.lower() not in VIDEO_EXTS:
                 target_file = cand
-        # 3. Clean image files on disk
         if target_file is None:
             for ext in [".png", ".webp", ".jpg", ".jpeg"]:
                 cand = job_dir / f"clean{ext}"
                 if cand.exists() and cand.stat().st_size > 0:
                     target_file = cand
                     break
-        # 4. Any clean.* or output.* images on disk
-        if target_file is None:
-            for cand in sorted(list(job_dir.glob("clean.*")) + list(job_dir.glob("output.*"))):
-                if cand.is_file() and cand.stat().st_size > 0 and cand.suffix.lower() not in VIDEO_EXTS:
-                    target_file = cand
-                    break
-        # 5. For video output, extract frame 0 on the fly if needed
-        if target_file is None:
-            for cand in sorted(job_dir.glob("clean.*")):
-                if cand.suffix.lower() in VIDEO_EXTS and cand.stat().st_size > 0:
-                    try:
-                        import cv2
-                        cap = cv2.VideoCapture(str(cand))
-                        ok, f0 = cap.read()
-                        cap.release()
-                        if ok and f0 is not None:
-                            out_jpg = job_dir / "preview_output.jpg"
-                            cv2.imwrite(str(out_jpg), f0)
-                            target_file = out_jpg
-                            break
-                    except Exception:
-                        pass
-        # 6. Fallback to preview_input.jpg if needed
         if target_file is None:
             cand = job_dir / "preview_input.jpg"
             if cand.exists() and cand.stat().st_size > 0:
                 target_file = cand
-
     elif which == "input":
-        # 1. Preview jpg first
         cand = job_dir / "preview_input.jpg"
         if cand.exists() and cand.stat().st_size > 0:
             target_file = cand
-        # 2. Input image files
         if target_file is None:
             for ext in [".png", ".webp", ".jpg", ".jpeg"]:
                 cand = job_dir / f"input{ext}"
                 if cand.exists() and cand.stat().st_size > 0:
                     target_file = cand
                     break
-        # 3. Any input.* images
-        if target_file is None:
-            for cand in sorted(job_dir.glob("input.*")):
-                if cand.is_file() and cand.stat().st_size > 0 and cand.suffix.lower() not in VIDEO_EXTS:
-                    target_file = cand
-                    break
-        # 4. If video input, extract frame 0 on the fly
-        if target_file is None:
-            for cand in sorted(job_dir.glob("input.*")):
-                if cand.suffix.lower() in VIDEO_EXTS and cand.stat().st_size > 0:
-                    try:
-                        import cv2
-                        cap = cv2.VideoCapture(str(cand))
-                        ok, f0 = cap.read()
-                        cap.release()
-                        if ok and f0 is not None:
-                            in_jpg = job_dir / "preview_input.jpg"
-                            cv2.imwrite(str(in_jpg), f0)
-                            target_file = in_jpg
-                            break
-                    except Exception:
-                        pass
     else:
         abort(404)
 
@@ -1269,173 +678,24 @@ def preview(job_id, which):
 
     ext = target_file.suffix.lower()
     mimetypes_map = {
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".webp": "image/webp",
-        ".gif": "image/gif",
-        ".svg": "image/svg+xml",
-        ".mp4": "video/mp4",
-        ".mov": "video/quicktime",
-        ".webm": "video/webm",
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".webp": "image/webp", ".gif": "image/gif", ".svg": "image/svg+xml",
+        ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
     }
     mimetype = mimetypes_map.get(ext, "image/jpeg")
     resp = send_file(str(target_file), mimetype=mimetype)
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
-    resp.headers["Pragma"] = "no-cache"
-    resp.headers["Expires"] = "0"
     return resp
 
 
-def detect_watermark_in_box(img, box):
-    """Accurately detect and snap to watermark text or logo within a user-drawn bounding box."""
-    import cv2
-    import numpy as np
-
-    if img is None or img.size == 0 or not box or len(box) != 4:
-        return {"detected": False, "box": box, "label": "Selected area"}
-
-    h_img, w_img = img.shape[:2]
-    bx, by, bw, bh = box
-    bx = max(0, min(w_img - 1, int(bx)))
-    by = max(0, min(h_img - 1, int(by)))
-    bw = max(1, min(w_img - bx, int(bw)))
-    bh = max(1, min(h_img - by, int(bh)))
-
-    # 1. Registered Gemini AI watermark check
-    try:
-        from remove_ai_watermarks.gemini_engine import GeminiEngine
-        engine = GeminiEngine()
-        det = engine.detect_watermark(img, trust_provenance=True)
-        if det.detected and det.region:
-            gx, gy, gw, gh = det.region
-            ix1 = max(bx, gx)
-            iy1 = max(by, gy)
-            ix2 = min(bx + bw, gx + gw)
-            iy2 = min(by + bh, gy + gh)
-            if ix2 > ix1 and iy2 > iy1:
-                return {
-                    "detected": True,
-                    "type": "gemini",
-                    "box": [int(gx), int(gy), int(gw), int(gh)],
-                    "label": "Gemini AI watermark detected",
-                }
-    except Exception:
-        pass
-
-    # 2. Universal watermark text/logo feature analysis on the subregion crop
-    crop = img[by:by+bh, bx:bx+bw]
-    if crop.shape[0] < 8 or crop.shape[1] < 8:
-        return {"detected": False, "box": [bx, by, bw, bh], "label": "Selected area"}
-
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    k_size = max(3, min(15, min(bw, bh) // 4))
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_size, k_size))
-    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
-    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
-    contrast = cv2.max(tophat, blackhat)
-
-    grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-    mag = cv2.magnitude(grad_x, grad_y)
-    mag = np.uint8(np.clip(mag / (mag.max() + 1e-5) * 255.0, 0, 255))
-
-    combined = cv2.max(contrast, mag)
-    _, thresh = cv2.threshold(combined, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    thresh_clean = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, close_kernel)
-
-    contours, _ = cv2.findContours(thresh_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    rects = []
-    total_crop_area = bw * bh
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < 8:
-            continue
-        cx, cy, cw, ch = cv2.boundingRect(cnt)
-        if cw > 0.95 * bw and ch > 0.95 * bh:
-            continue
-        rects.append((cx, cy, cw, ch))
-
-    if rects:
-        min_x = min(r[0] for r in rects)
-        min_y = min(r[1] for r in rects)
-        max_x = max(r[0] + r[2] for r in rects)
-        max_y = max(r[1] + r[3] for r in rects)
-
-        union_w = max_x - min_x
-        union_h = max_y - min_y
-        union_area = union_w * union_h
-
-        # If detected components form a cohesive watermark cluster inside the selection:
-        if 0.05 * total_crop_area <= union_area <= 0.92 * total_crop_area and union_w >= 8 and union_h >= 8:
-            pad = 6
-            snapped_bx = max(0, bx + min_x - pad)
-            snapped_by = max(0, by + min_y - pad)
-            snapped_bw = min(w_img - snapped_bx, union_w + 2 * pad)
-            snapped_bh = min(h_img - snapped_by, union_h + 2 * pad)
-            return {
-                "detected": True,
-                "type": "watermark",
-                "box": [int(snapped_bx), int(snapped_by), int(snapped_bw), int(snapped_bh)],
-                "label": "Watermark detected",
-            }
-
-    return {
-        "detected": False,
-        "type": "manual",
-        "box": [bx, by, bw, bh],
-        "label": "Manual selection",
-    }
-
-
-@app.route("/api/detect_box/<job_id>", methods=["POST"])
-def detect_box(job_id):
-    with JOBS_LOCK:
-        job = JOBS.get(job_id)
-    job_dir = WORKDIR / job_id
-    if not job:
-        if not job_dir.exists():
-            abort(404)
-        job = {"id": job_id, "filename": "image.jpg"}
-
-    data = request.get_json(silent=True) or request.form or {}
-    box = data.get("box")
-    if isinstance(box, str):
-        try:
-            box = [int(float(v.strip())) for v in box.split(",") if v.strip()]
-        except Exception:
-            box = None
-
-    if not box or len(box) != 4:
-        return jsonify({"error": "Invalid box coordinates"}), 400
-
-    ext = Path(job.get("filename", "")).suffix.lower()
-
-    import cv2
-    img = None
-    if ext in VIDEO_EXTS:
-        p = job_dir / "preview_input.jpg"
-        if not p.exists():
-            p = job_dir / "preview_output.jpg"
-        if p.exists():
-            img = cv2.imread(str(p))
-    else:
-        p = job_dir / f"input{ext}"
-        if not p.exists():
-            p = Path(job.get("out_path", ""))
-        if p.exists():
-            img = cv2.imread(str(p))
-
-    if img is None:
-        return jsonify({"status": "ok", "detected": False, "box": box, "label": "Manual selection"})
-
-    result = detect_watermark_in_box(img, box)
-    return jsonify({"status": "ok", **result})
-
-
+@app.route("/erase-box", methods=["POST"])
 @app.route("/api/reclean/<job_id>", methods=["POST"])
-def reclean(job_id):
+def reclean(job_id=None):
+    if not job_id:
+        job_id = request.form.get("job_id") or (request.get_json(silent=True) or {}).get("job_id")
+    if not job_id:
+        return jsonify({"error": "No job_id provided"}), 400
+
     with JOBS_LOCK:
         job = JOBS.get(job_id)
     job_dir = WORKDIR / job_id
@@ -1444,17 +704,9 @@ def reclean(job_id):
             abort(404)
         in_files = list(job_dir.glob("input.*"))
         out_files = list(job_dir.glob("clean.*"))
-        if not in_files and not out_files:
-            abort(404)
         fname = in_files[0].name if in_files else (out_files[0].name if out_files else "image.jpg")
         out_p = str(out_files[0]) if out_files else str(job_dir / f"clean{Path(fname).suffix}")
-        job = {
-            "id": job_id,
-            "filename": fname,
-            "out_path": out_p,
-            "stage": "done",
-            "percent": 100,
-        }
+        job = {"id": job_id, "filename": fname, "out_path": out_p, "stage": "done", "percent": 100}
         with JOBS_LOCK:
             JOBS[job_id] = job
 
@@ -1477,31 +729,18 @@ def reclean(job_id):
         import numpy as np
         from remove_ai_watermarks import region_eraser
 
-        # Read existing clean image if available to erase on top of previous clean passes
         target_img = None
         if out_path.exists() and out_path.stat().st_size > 0:
             target_img = cv2.imread(str(out_path), cv2.IMREAD_UNCHANGED)
-        if target_img is None:
-            for cand in [job_dir / f"clean{ext}", job_dir / "preview_output.jpg"]:
-                if cand.exists() and cand.stat().st_size > 0:
-                    target_img = cv2.imread(str(cand), cv2.IMREAD_UNCHANGED)
-                    if target_img is not None:
-                        break
-        # Fall back to original input image
         if target_img is None:
             target_img = cv2.imread(str(job_dir / f"input{ext}"), cv2.IMREAD_UNCHANGED)
 
         if target_img is None:
             return jsonify({"error": "Could not read image file"}), 500
 
-        # Normalize and clamp box coordinates to image dimensions
         bx, by, bw, bh = int(box[0]), int(box[1]), int(box[2]), int(box[3])
-        if bw < 0:
-            bx += bw
-            bw = abs(bw)
-        if bh < 0:
-            by += bh
-            bh = abs(bh)
+        if bw < 0: bx += bw; bw = abs(bw)
+        if bh < 0: by += bh; bh = abs(bh)
 
         h, w = target_img.shape[:2]
         bx = max(0, min(w - 1, bx))
@@ -1509,18 +748,9 @@ def reclean(job_id):
         bw = max(1, min(w - bx, bw))
         bh = max(1, min(h - by, bh))
 
-        # Erase selected object/region using the high-accuracy LaMa neural network
-        cleaned = region_eraser.erase(
-            target_img,
-            boxes=[(bx, by, bw, bh)],
-            backend="lama",
-            dilate=5,
-        )
-
-        # Write clean output file
+        cleaned = region_eraser.erase(target_img, boxes=[(bx, by, bw, bh)], backend="lama", dilate=5)
         cv2.imwrite(str(out_path), cleaned)
 
-        # Crucial: update preview_output.jpg so preview endpoint immediately shows the erased result
         preview_jpg = job_dir / "preview_output.jpg"
         preview_bgr = cleaned[:, :, :3] if cleaned.ndim == 3 and cleaned.shape[2] == 4 else cleaned
         cv2.imwrite(str(preview_jpg), preview_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
@@ -1549,76 +779,1254 @@ def reclean(job_id):
         return jsonify({"error": "Unsupported file format"}), 400
 
 
-def get_downloads_folder():
-    """Returns user's default Downloads directory on Windows, macOS, or Linux."""
-    if sys.platform == "win32":
-        try:
-            import winreg
-            sub_key = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders"
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, sub_key) as key:
-                val, _ = winreg.QueryValueEx(key, "{374DE290-123F-4565-9164-39C4925E467B}")
-                if os.path.isdir(val):
-                    return Path(val)
-        except Exception:
-            pass
-    return Path.home() / "Downloads"
-
-
-@app.route("/api/save_to_downloads/<job_id>", methods=["POST"])
-def save_to_downloads(job_id):
+@app.route("/api/detect_box/<job_id>", methods=["POST"])
+def detect_box_endpoint(job_id):
     with JOBS_LOCK:
         job = JOBS.get(job_id)
-    if not job or job.get("stage") != "done":
-        abort(404)
+    job_dir = WORKDIR / job_id
+    if not job:
+        if not job_dir.exists():
+            abort(404)
+        job = {"id": job_id, "filename": "image.jpg"}
 
-    out_path = Path(job.get("out_path", ""))
-    if not out_path.exists():
-        return jsonify({"error": "Cleaned file not found"}), 404
+    data = request.get_json(silent=True) or request.form or {}
+    box = data.get("box")
+    if isinstance(box, str):
+        try:
+            box = [int(float(v.strip())) for v in box.split(",") if v.strip()]
+        except Exception:
+            box = None
 
-    try:
-        dl_dir = get_downloads_folder()
-        dl_dir.mkdir(parents=True, exist_ok=True)
+    if not box or len(box) != 4:
+        return jsonify({"error": "Invalid box coordinates"}), 400
 
-        orig_name = job.get("filename", "clean_file")
-        stem = Path(orig_name).stem
-        ext = out_path.suffix or Path(orig_name).suffix
-        clean_name = f"removix_{stem}{ext}"
+    ext = Path(job.get("filename", "")).suffix.lower()
+    import cv2
+    img = None
+    if ext in VIDEO_EXTS:
+        p = job_dir / "preview_input.jpg"
+        if not p.exists(): p = job_dir / "preview_output.jpg"
+        if p.exists(): img = cv2.imread(str(p))
+    else:
+        p = job_dir / f"input{ext}"
+        if not p.exists(): p = Path(job.get("out_path", ""))
+        if p.exists(): img = cv2.imread(str(p))
 
-        dest = dl_dir / clean_name
-        counter = 1
-        while dest.exists():
-            dest = dl_dir / f"removix_{stem}_{counter}{ext}"
-            counter += 1
+    if img is None:
+        return jsonify({"status": "ok", "detected": False, "box": box, "label": "Manual selection"})
 
-        shutil.copy2(out_path, dest)
-        return jsonify({
-            "status": "ok",
-            "filename": dest.name,
-            "path": str(dest),
-            "message": f"Saved directly to Downloads folder: {dest.name}"
-        })
-    except Exception as err:
-        return jsonify({"error": str(err)}), 500
+    result = detect_watermark_in_box(img, box)
+    return jsonify({"status": "ok", **result})
 
 
+@app.route("/download/<job_id>")
 @app.route("/api/download/<job_id>")
 def download(job_id):
     with JOBS_LOCK:
         job = JOBS.get(job_id)
     job_dir = WORKDIR / job_id
     if job and job.get("out_path") and Path(job["out_path"]).exists():
-        return send_file(job["out_path"], as_attachment=True, download_name=f"removix_{job['filename']}")
+        p = Path(job["out_path"])
+        dl_name = f"removix_{job['filename']}"
+        try:
+            ext = p.suffix.lower()
+            f_type = "Video" if ext in VIDEO_EXTS else "Image"
+            activity_tracker.log_file(
+                file_name=dl_name,
+                file_type=f_type,
+                file_size_bytes=p.stat().st_size,
+                tool_name="Watermark Remover",
+                download_path=str(p),
+            )
+        except Exception:
+            pass
+        return send_file(str(p), as_attachment=True, download_name=dl_name)
     for cand in sorted(list(job_dir.glob("clean.*")) + list(job_dir.glob("output.*"))):
         if cand.is_file() and cand.stat().st_size > 0:
             fn = job.get("filename", cand.name) if job else cand.name
-            return send_file(str(cand), as_attachment=True, download_name=f"removix_{fn}")
+            dl_name = f"removix_{fn}"
+            try:
+                ext = cand.suffix.lower()
+                f_type = "Video" if ext in VIDEO_EXTS else "Image"
+                activity_tracker.log_file(
+                    file_name=dl_name,
+                    file_type=f_type,
+                    file_size_bytes=cand.stat().st_size,
+                    tool_name="Watermark Remover",
+                    download_path=str(cand),
+                )
+            except Exception:
+                pass
+            return send_file(str(cand), as_attachment=True, download_name=dl_name)
     abort(404)
 
+
+# =====================================================================
+# 3. NEW FEATURES API ENDPOINTS (modules.pdf_tools & modules.converter)
+# =====================================================================
+
+@app.route("/api/image-to-pdf", methods=["POST"])
+def api_image_to_pdf():
+    files = request.files.getlist("images")
+    if not files or len(files) == 0 or not files[0].filename:
+        return jsonify({"error": "No images provided for PDF conversion."}), 400
+
+    task_id = uuid.uuid4().hex[:12]
+    task_dir = Path(tempfile.gettempdir()) / "removix_tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_images = []
+    for idx, f in enumerate(files):
+        if f.filename:
+            safe_name = Path(f.filename).name
+            p = task_dir / f"{idx:03d}_{safe_name}"
+            f.save(str(p))
+            saved_images.append(p)
+
+    out_pdf = task_dir / "Removix_Document.pdf"
+    try:
+        images_to_pdf(saved_images, out_pdf)
+        try:
+            sz = out_pdf.stat().st_size if out_pdf.exists() else 1024
+            activity_tracker.log_file(
+                file_name="Removix_Document.pdf",
+                file_type="PDF",
+                file_size_bytes=sz,
+                tool_name="Image to PDF",
+                download_path=str(out_pdf),
+            )
+        except Exception:
+            pass
+        return send_file(
+            str(out_pdf),
+            as_attachment=True,
+            download_name="Removix_Document.pdf",
+            mimetype="application/pdf",
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/pdf-to-image", methods=["POST"])
+def api_pdf_to_image():
+    if "pdf" not in request.files or not request.files["pdf"].filename:
+        return jsonify({"error": "No PDF document received."}), 400
+
+    f = request.files["pdf"]
+    fmt = request.form.get("format", "PNG").upper().strip()
+
+    task_id = uuid.uuid4().hex[:12]
+    task_dir = Path(tempfile.gettempdir()) / "removix_tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = Path(f.filename).name
+    pdf_path = task_dir / safe_name
+    f.save(str(pdf_path))
+
+    out_dir = task_dir / "extracted_images"
+    try:
+        res_path, page_count, is_zip = pdf_to_images(pdf_path, out_dir, dpi=300, fmt=fmt)
+        ext = "zip" if is_zip else fmt.lower()
+        mimetype = "application/zip" if is_zip else f"image/{ext}"
+        base_stem = Path(safe_name).stem
+        dl_name = f"{base_stem}_pages.{ext}"
+        try:
+            sz = Path(res_path).stat().st_size if Path(res_path).exists() else 1024
+            activity_tracker.log_file(
+                file_name=dl_name,
+                file_type="Image",
+                file_size_bytes=sz,
+                tool_name="PDF to Image",
+                download_path=str(res_path),
+            )
+        except Exception:
+            pass
+        return send_file(
+            res_path,
+            as_attachment=True,
+            download_name=dl_name,
+            mimetype=mimetype,
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/merge-pdf", methods=["POST"])
+def api_merge_pdf():
+    files = request.files.getlist("files")
+    if not files or len(files) < 2 or not files[0].filename:
+        return jsonify({"error": "At least two PDF files are required for merging."}), 400
+
+    task_id = uuid.uuid4().hex[:12]
+    task_dir = Path(tempfile.gettempdir()) / "removix_tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_pdfs = []
+    for idx, f in enumerate(files):
+        if f.filename:
+            safe_name = Path(f.filename).name
+            p = task_dir / f"{idx:03d}_{safe_name}"
+            f.save(str(p))
+            saved_pdfs.append(p)
+
+    out_pdf = task_dir / "removix_merged.pdf"
+    try:
+        merge_pdfs(saved_pdfs, out_pdf)
+        try:
+            sz = out_pdf.stat().st_size if out_pdf.exists() else 1024
+            activity_tracker.log_file(
+                file_name="removix_merged.pdf",
+                file_type="PDF",
+                file_size_bytes=sz,
+                tool_name="Merge PDF",
+                download_path=str(out_pdf),
+            )
+        except Exception:
+            pass
+        return send_file(
+            str(out_pdf),
+            as_attachment=True,
+            download_name="removix_merged.pdf",
+            mimetype="application/pdf",
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/split-pdf", methods=["POST"])
+def api_split_pdf():
+    if "pdf" not in request.files or not request.files["pdf"].filename:
+        return jsonify({"error": "No PDF document received."}), 400
+
+    f = request.files["pdf"]
+    split_mode = request.form.get("mode", "all").strip().lower()
+    range_str = request.form.get("range", "").strip()
+
+    task_id = uuid.uuid4().hex[:12]
+    task_dir = Path(tempfile.gettempdir()) / "removix_tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = Path(f.filename).name
+    pdf_path = task_dir / safe_name
+    f.save(str(pdf_path))
+
+    out_dir = task_dir / "split_output"
+    try:
+        res_path, is_zip = split_pdf(pdf_path, out_dir, split_mode=split_mode, range_str=range_str)
+        mimetype = "application/zip" if is_zip else "application/pdf"
+        dl_name = "removix_split_pages.zip" if is_zip else "removix_extracted.pdf"
+        try:
+            sz = Path(res_path).stat().st_size if Path(res_path).exists() else 1024
+            activity_tracker.log_file(
+                file_name=dl_name,
+                file_type="PDF",
+                file_size_bytes=sz,
+                tool_name="Split PDF",
+                download_path=str(res_path),
+            )
+        except Exception:
+            pass
+        return send_file(
+            res_path,
+            as_attachment=True,
+            download_name=dl_name,
+            mimetype=mimetype,
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/rotate-pdf", methods=["POST"])
+def api_rotate_pdf():
+    if "pdf" not in request.files or not request.files["pdf"].filename:
+        return jsonify({"error": "No PDF document received."}), 400
+
+    f = request.files["pdf"]
+    try:
+        angle = int(request.form.get("angle", 90))
+    except (ValueError, TypeError):
+        angle = 90
+    scope = request.form.get("scope", "all").strip().lower()
+    range_str = request.form.get("range", "").strip()
+
+    task_id = uuid.uuid4().hex[:12]
+    task_dir = Path(tempfile.gettempdir()) / "removix_tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = Path(f.filename).name
+    pdf_path = task_dir / safe_name
+    f.save(str(pdf_path))
+
+    out_pdf = task_dir / "removix_rotated.pdf"
+    try:
+        rotate_pdf(pdf_path, out_pdf, angle=angle, page_selection=scope, range_str=range_str)
+        try:
+            sz = out_pdf.stat().st_size if out_pdf.exists() else 1024
+            activity_tracker.log_file(
+                file_name="removix_rotated.pdf",
+                file_type="PDF",
+                file_size_bytes=sz,
+                tool_name="Rotate PDF",
+                download_path=str(out_pdf),
+            )
+        except Exception:
+            pass
+        return send_file(
+            str(out_pdf),
+            as_attachment=True,
+            download_name="removix_rotated.pdf",
+            mimetype="application/pdf",
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/delete-pages", methods=["POST"])
+def api_delete_pages():
+    if "pdf" not in request.files or not request.files["pdf"].filename:
+        return jsonify({"error": "No PDF document received."}), 400
+
+    f = request.files["pdf"]
+    pages_to_remove = request.form.get("pages", "").strip()
+    if not pages_to_remove:
+        return jsonify({"error": "No pages specified for deletion."}), 400
+
+    task_id = uuid.uuid4().hex[:12]
+    task_dir = Path(tempfile.gettempdir()) / "removix_tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = Path(f.filename).name
+    pdf_path = task_dir / safe_name
+    f.save(str(pdf_path))
+
+    out_pdf = task_dir / "removix_cleaned.pdf"
+    try:
+        delete_pdf_pages(pdf_path, out_pdf, pages_to_remove)
+        try:
+            sz = out_pdf.stat().st_size if out_pdf.exists() else 1024
+            activity_tracker.log_file(
+                file_name="removix_cleaned.pdf",
+                file_type="PDF",
+                file_size_bytes=sz,
+                tool_name="Delete Pages",
+                download_path=str(out_pdf),
+            )
+        except Exception:
+            pass
+        return send_file(
+            str(out_pdf),
+            as_attachment=True,
+            download_name="removix_cleaned.pdf",
+            mimetype="application/pdf",
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/protect-pdf", methods=["POST"])
+def api_protect_pdf():
+    if "pdf" not in request.files or not request.files["pdf"].filename:
+        return jsonify({"error": "No PDF document received."}), 400
+
+    f = request.files["pdf"]
+    password = request.form.get("password", "").strip()
+    if not password:
+        return jsonify({"error": "A password is required to protect the PDF."}), 400
+
+    task_id = uuid.uuid4().hex[:12]
+    task_dir = Path(tempfile.gettempdir()) / "removix_tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = Path(f.filename).name
+    pdf_path = task_dir / safe_name
+    f.save(str(pdf_path))
+
+    out_pdf = task_dir / "removix_protected.pdf"
+    try:
+        protect_pdf(pdf_path, out_pdf, password)
+        try:
+            sz = out_pdf.stat().st_size if out_pdf.exists() else 1024
+            activity_tracker.log_file(
+                file_name="removix_protected.pdf",
+                file_type="PDF",
+                file_size_bytes=sz,
+                tool_name="Protect PDF",
+                download_path=str(out_pdf),
+            )
+        except Exception:
+            pass
+        return send_file(
+            str(out_pdf),
+            as_attachment=True,
+            download_name="removix_protected.pdf",
+            mimetype="application/pdf",
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/unlock-pdf", methods=["POST"])
+def api_unlock_pdf():
+    if "pdf" not in request.files or not request.files["pdf"].filename:
+        return jsonify({"error": "No PDF document received."}), 400
+
+    f = request.files["pdf"]
+    password = request.form.get("password", "").strip()
+
+    task_id = uuid.uuid4().hex[:12]
+    task_dir = Path(tempfile.gettempdir()) / "removix_tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = Path(f.filename).name
+    pdf_path = task_dir / safe_name
+    f.save(str(pdf_path))
+
+    out_pdf = task_dir / "removix_unlocked.pdf"
+    try:
+        unlock_pdf(pdf_path, out_pdf, password)
+        try:
+            sz = out_pdf.stat().st_size if out_pdf.exists() else 1024
+            activity_tracker.log_file(
+                file_name="removix_unlocked.pdf",
+                file_type="PDF",
+                file_size_bytes=sz,
+                tool_name="Unlock PDF",
+                download_path=str(out_pdf),
+            )
+        except Exception:
+            pass
+        return send_file(
+            str(out_pdf),
+            as_attachment=True,
+            download_name="removix_unlocked.pdf",
+            mimetype="application/pdf",
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/word-to-pdf", methods=["POST"])
+def api_word_to_pdf():
+    if "file" not in request.files or not request.files["file"].filename:
+        return jsonify({"error": "No Word document received."}), 400
+
+    f = request.files["file"]
+    task_id = uuid.uuid4().hex[:12]
+    task_dir = Path(tempfile.gettempdir()) / "removix_tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = Path(f.filename).name
+    word_path = task_dir / safe_name
+    f.save(str(word_path))
+
+    out_pdf = task_dir / "removix_converted.pdf"
+    try:
+        word_to_pdf(word_path, out_pdf)
+        try:
+            sz = out_pdf.stat().st_size if out_pdf.exists() else 1024
+            activity_tracker.log_file(
+                file_name="removix_converted.pdf",
+                file_type="PDF",
+                file_size_bytes=sz,
+                tool_name="Word to PDF",
+                download_path=str(out_pdf),
+            )
+        except Exception:
+            pass
+        return send_file(
+            str(out_pdf),
+            as_attachment=True,
+            download_name="removix_converted.pdf",
+            mimetype="application/pdf",
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/edit-pdf", methods=["POST"])
+def api_edit_pdf():
+    import base64
+
+    if "pdf" not in request.files or not request.files["pdf"].filename:
+        return jsonify({"error": "No PDF document received."}), 400
+
+    f = request.files["pdf"]
+    tool = request.form.get("tool", "text").strip().lower()
+
+    task_id = uuid.uuid4().hex[:12]
+    task_dir = Path(tempfile.gettempdir()) / "removix_tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = Path(f.filename).name
+    pdf_path = task_dir / safe_name
+    f.save(str(pdf_path))
+
+    out_pdf = task_dir / "removix_edited.pdf"
+    try:
+        if tool == "text":
+            text_val = request.form.get("text", "")
+            page_num = int(request.form.get("page", 1))
+            f_size = float(request.form.get("fontsize", 14))
+            pos_x = float(request.form.get("x", 54))
+            pos_y = float(request.form.get("y", 100))
+            color_val = request.form.get("color", "#0f172a")
+            add_text_to_pdf(pdf_path, out_pdf, page_num, text_val, pos_x, pos_y, f_size, color_val)
+
+        elif tool == "replace":
+            search_val = request.form.get("search_text", "")
+            replace_val = request.form.get("replace_text", "")
+            replace_text_in_pdf(pdf_path, out_pdf, search_val, replace_val)
+
+        elif tool == "image":
+            if "image" not in request.files or not request.files["image"].filename:
+                return jsonify({"error": "No image uploaded."}), 400
+            img_file = request.files["image"]
+            img_path = task_dir / f"stamp_{Path(img_file.filename).name}"
+            img_file.save(str(img_path))
+            page_num = int(request.form.get("page", 1))
+            pos_x = float(request.form.get("x", 50))
+            pos_y = float(request.form.get("y", 100))
+            width_val = float(request.form.get("width", 150))
+            # Calculate height maintaining reasonable aspect ratio or default
+            height_val = width_val * 0.65
+            add_image_to_pdf(pdf_path, out_pdf, img_path, page_num, pos_x, pos_y, width_val, height_val)
+
+        elif tool == "shape":
+            shape_type = request.form.get("shape", "rect")
+            stroke = request.form.get("stroke", "#0284c7")
+            page_num = int(request.form.get("page", 1))
+            x1 = float(request.form.get("x1", 50))
+            y1 = float(request.form.get("y1", 50))
+            x2 = float(request.form.get("x2", 200))
+            y2 = float(request.form.get("y2", 150))
+            add_shape_to_pdf(pdf_path, out_pdf, page_num, shape_type, x1, y1, x2, y2, stroke_color=stroke)
+
+        elif tool == "annotate":
+            search_val = request.form.get("search_text", "")
+            annot_type = request.form.get("annot_type", "highlight")
+            page_num = int(request.form.get("page", 1))
+            annotate_pdf_text(pdf_path, out_pdf, page_num, annot_type, search_val)
+
+        elif tool == "signature":
+            data_url = request.form.get("signature_data", "")
+            if not data_url or "," not in data_url:
+                return jsonify({"error": "Invalid signature data."}), 400
+            header, encoded = data_url.split(",", 1)
+            sig_bytes = base64.b64decode(encoded)
+            sig_path = task_dir / "signature.png"
+            with open(sig_path, "wb") as sf:
+                sf.write(sig_bytes)
+            page_num = int(request.form.get("page", 1))
+            pos_x = float(request.form.get("x", 350))
+            pos_y = float(request.form.get("y", 650))
+            add_image_to_pdf(pdf_path, out_pdf, sig_path, page_num, pos_x, pos_y, 160, 60)
+
+        elif tool == "redact":
+            page_num = int(request.form.get("page", 1))
+            x1 = float(request.form.get("x1", 50))
+            y1 = float(request.form.get("y1", 100))
+            x2 = float(request.form.get("x2", 300))
+            y2 = float(request.form.get("y2", 140))
+            redact_pdf_area(pdf_path, out_pdf, page_num, x1, y1, x2, y2)
+
+        try:
+            sz = out_pdf.stat().st_size if out_pdf.exists() else 1024
+            activity_tracker.log_file(
+                file_name="removix_edited.pdf",
+                file_type="PDF",
+                file_size_bytes=sz,
+                tool_name="Edit PDF",
+                download_path=str(out_pdf),
+            )
+        except Exception:
+            pass
+        return send_file(
+            str(out_pdf),
+            as_attachment=True,
+            download_name="removix_edited.pdf",
+            mimetype="application/pdf",
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/format-convert", methods=["POST"])
+def api_format_convert():
+    if "file" not in request.files or not request.files["file"].filename:
+        return jsonify({"error": "No file received for conversion."}), 400
+
+    f = request.files["file"]
+    target_format = request.form.get("target_format", "PNG").upper().strip().lstrip(".")
+
+    task_id = uuid.uuid4().hex[:12]
+    task_dir = Path(tempfile.gettempdir()) / "removix_tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = Path(f.filename).name
+    in_path = task_dir / safe_name
+    f.save(str(in_path))
+
+    stem = Path(safe_name).stem
+    out_ext = target_format.lower()
+    if out_ext == "jpeg":
+        out_ext = "jpg"
+    out_path = task_dir / f"{stem}_converted.{out_ext}"
+
+    src_ext = in_path.suffix.lower()
+    is_img = src_ext in (".png", ".jpg", ".jpeg", ".webp", ".svg", ".bmp", ".ico", ".tiff", ".pdf")
+
+    try:
+        if is_img and target_format in ("PNG", "JPG", "JPEG", "WEBP", "SVG", "ICO", "PDF", "BMP"):
+            convert_image(in_path, out_path, target_format)
+        else:
+            convert_media(in_path, out_path, target_format)
+
+        mimetypes_map = {
+            "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+            "webp": "image/webp", "svg": "image/svg+xml", "pdf": "application/pdf",
+            "mp4": "video/mp4", "mov": "video/quicktime", "webm": "video/webm",
+            "gif": "image/gif", "mp3": "audio/mpeg", "wav": "audio/wav", "mkv": "video/x-matroska",
+        }
+        mimetype = mimetypes_map.get(out_ext, "application/octet-stream")
+        try:
+            sz = out_path.stat().st_size if out_path.exists() else 1024
+            ext_lower = out_path.suffix.lower()
+            f_type = "Video" if ext_lower in VIDEO_EXTS else ("PDF" if ext_lower == ".pdf" else "Image")
+            activity_tracker.log_file(
+                file_name=out_path.name,
+                file_type=f_type,
+                file_size_bytes=sz,
+                tool_name=f"Convert to {target_format}",
+                download_path=str(out_path),
+            )
+        except Exception:
+            pass
+        return send_file(
+            str(out_path),
+            as_attachment=True,
+            download_name=out_path.name,
+            mimetype=mimetype,
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/qr-generate", methods=["POST"])
+def api_qr_generate():
+    data = request.get_json(silent=True) or request.form or {}
+    text = data.get("text", "").strip()
+    if not text:
+        return jsonify({"error": "No text or link provided."}), 400
+
+    fill_color = data.get("fill_color", "#0f172a")
+    back_color = data.get("back_color", "#ffffff")
+    format_opt = data.get("format", "PNG").upper().strip()
+
+    try:
+        _, data_url, mime_type, file_ext, dimensions = generate_qr(
+            text=text,
+            fill_color=fill_color,
+            back_color=back_color,
+            format=format_opt,
+        )
+        return jsonify({
+            "status": "ok",
+            "data_url": data_url,
+            "format": file_ext,
+            "mime_type": mime_type,
+            "dimensions": dimensions,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/ocr", methods=["POST"])
+def api_ocr():
+    f = request.files.get("file") or request.files.get("image")
+    if not f or not f.filename:
+        return jsonify({"error": "No file received for OCR."}), 400
+
+    lang = request.form.get("lang", "eng+hin").strip()
+
+    task_id = uuid.uuid4().hex[:12]
+    task_dir = Path(tempfile.gettempdir()) / "removix_tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = Path(f.filename).name
+    file_path = task_dir / safe_name
+    f.save(str(file_path))
+
+    try:
+        res = extract_text_from_file(file_path, lang=lang)
+        text = res.get("text", "").strip()
+        is_pdf = res.get("is_pdf", False)
+        if not text:
+            msg = "No readable text was found in this image."
+            return jsonify({
+                "status": "empty",
+                "text": "",
+                "message": msg,
+                "is_pdf": is_pdf,
+                "truncated": res.get("truncated", False),
+                "total_pages": res.get("total_pages", 1),
+                "processed_pages": res.get("processed_pages", 1),
+            })
+
+        return jsonify({
+            "status": "ok",
+            "text": text,
+            "is_pdf": is_pdf,
+            "truncated": res.get("truncated", False),
+            "total_pages": res.get("total_pages", 1),
+            "processed_pages": res.get("processed_pages", 1),
+            "lang": lang,
+        })
+    except PdfProcessingError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        try:
+            shutil.rmtree(str(task_dir), ignore_errors=True)
+        except Exception:
+            pass
+
+
+@app.route("/api/bg-remove/model-status", methods=["GET"])
+def api_bg_model_status():
+    return jsonify(get_download_status())
+
+
+@app.route("/api/bg-remove/download-model", methods=["POST"])
+def api_bg_model_download():
+    trigger_model_download()
+    return jsonify(get_download_status())
+
+
+@app.route("/api/bg-remove", methods=["POST"])
+def api_bg_remove():
+    if "image" not in request.files or not request.files["image"].filename:
+        return jsonify({"error": "No image received for background removal."}), 400
+
+    f = request.files["image"]
+    mode = request.form.get("mode", "fast").strip().lower()
+
+    task_id = uuid.uuid4().hex[:12]
+    task_dir = Path(tempfile.gettempdir()) / "removix_tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = Path(f.filename).name
+    in_path = task_dir / safe_name
+    f.save(str(in_path))
+
+    stem = Path(safe_name).stem
+    out_path = task_dir / f"{stem}_transparent.png"
+
+    # If model is not ready, automatically trigger download and await completion
+    if not is_model_available():
+        trigger_model_download()
+        wait_seconds = 0
+        while not is_model_available() and wait_seconds < 120:
+            time.sleep(1.0)
+            wait_seconds += 1
+
+        if not is_model_available():
+            status = get_download_status()
+            err = status.get("error") or "Timed out while downloading BiRefNet AI model. Please check network connection."
+            return jsonify({"error": err}), 504
+
+    try:
+        remove_background(in_path, out_path, mode=mode)
+        try:
+            sz = out_path.stat().st_size if out_path.exists() else 1024
+            activity_tracker.log_file(
+                file_name=out_path.name,
+                file_type="Image",
+                file_size_bytes=sz,
+                tool_name="Remove Background",
+                download_path=str(out_path),
+            )
+        except Exception:
+            pass
+        return send_file(
+            str(out_path),
+            as_attachment=True,
+            download_name=out_path.name,
+            mimetype="image/png",
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# =====================================================================
+# 3. IMAGE TOOLS API ENDPOINTS
+# =====================================================================
+
+def _handle_image_tool_file(target_ext, mimetype, process_fn):
+    if "file" not in request.files or not request.files["file"].filename:
+        return jsonify({"error": "No image file uploaded."}), 400
+    f = request.files["file"]
+    task_id = uuid.uuid4().hex[:12]
+    task_dir = Path(tempfile.gettempdir()) / "removix_tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(f.filename).name
+    in_path = task_dir / safe_name
+    f.save(str(in_path))
+    stem = Path(safe_name).stem
+    out_path = task_dir / f"{stem}_processed.{target_ext}"
+    try:
+        process_fn(in_path, out_path)
+        try:
+            sz = out_path.stat().st_size if out_path.exists() else in_path.stat().st_size
+            tool_name = request.endpoint.replace("api_", "").replace("_", " ").title() if request.endpoint else "Image Tool"
+            activity_tracker.log_file(
+                file_name=out_path.name,
+                file_type="Image",
+                file_size_bytes=sz,
+                tool_name=tool_name,
+                download_path=str(out_path),
+            )
+        except Exception:
+            pass
+        return send_file(
+            str(out_path),
+            as_attachment=True,
+            download_name=out_path.name,
+            mimetype=mimetype,
+        )
+    except Exception as e:
+        return jsonify({"error": "Could not process this image. Please try again."}), 500
+
+
+# 17 Format Converter APIs
+@app.route("/api/png-to-jpg", methods=["POST"])
+def api_png_to_jpg():
+    return _handle_image_tool_file("jpg", "image/jpeg", convert_png_to_jpg)
+
+
+@app.route("/api/jpg-to-png", methods=["POST"])
+def api_jpg_to_png():
+    return _handle_image_tool_file("png", "image/png", convert_jpg_to_png)
+
+
+@app.route("/api/webp-to-jpg", methods=["POST"])
+def api_webp_to_jpg():
+    return _handle_image_tool_file("jpg", "image/jpeg", convert_webp_to_jpg)
+
+
+@app.route("/api/jpg-to-webp", methods=["POST"])
+def api_jpg_to_webp():
+    return _handle_image_tool_file("webp", "image/webp", convert_jpg_to_webp)
+
+
+@app.route("/api/png-to-webp", methods=["POST"])
+def api_png_to_webp():
+    return _handle_image_tool_file("webp", "image/webp", convert_png_to_webp)
+
+
+@app.route("/api/webp-to-png", methods=["POST"])
+def api_webp_to_png():
+    return _handle_image_tool_file("png", "image/png", convert_webp_to_png)
+
+
+@app.route("/api/png-to-svg", methods=["POST"])
+def api_png_to_svg():
+    return _handle_image_tool_file("svg", "image/svg+xml", convert_png_to_svg)
+
+
+@app.route("/api/jpg-to-svg", methods=["POST"])
+def api_jpg_to_svg():
+    return _handle_image_tool_file("svg", "image/svg+xml", convert_jpg_to_svg)
+
+
+@app.route("/api/svg-to-png", methods=["POST"])
+def api_svg_to_png():
+    return _handle_image_tool_file("png", "image/png", convert_svg_to_png)
+
+
+@app.route("/api/jpg-to-gif", methods=["POST"])
+def api_jpg_to_gif():
+    return _handle_image_tool_file("gif", "image/gif", convert_jpg_to_gif)
+
+
+@app.route("/api/gif-to-jpg", methods=["POST"])
+def api_gif_to_jpg():
+    return _handle_image_tool_file("jpg", "image/jpeg", convert_gif_to_jpg)
+
+
+@app.route("/api/png-to-gif", methods=["POST"])
+def api_png_to_gif():
+    return _handle_image_tool_file("gif", "image/gif", convert_png_to_gif)
+
+
+@app.route("/api/gif-to-png", methods=["POST"])
+def api_gif_to_png():
+    return _handle_image_tool_file("png", "image/png", convert_gif_to_png)
+
+
+@app.route("/api/jpg-to-tiff", methods=["POST"])
+def api_jpg_to_tiff():
+    return _handle_image_tool_file("tiff", "image/tiff", convert_jpg_to_tiff)
+
+
+@app.route("/api/tiff-to-jpg", methods=["POST"])
+def api_tiff_to_jpg():
+    return _handle_image_tool_file("jpg", "image/jpeg", convert_tiff_to_jpg)
+
+
+@app.route("/api/png-to-tiff", methods=["POST"])
+def api_png_to_tiff():
+    return _handle_image_tool_file("tiff", "image/tiff", convert_png_to_tiff)
+
+
+@app.route("/api/tiff-to-png", methods=["POST"])
+def api_tiff_to_png():
+    return _handle_image_tool_file("png", "image/png", convert_tiff_to_png)
+
+
+# 10 Custom Image Tool APIs
+@app.route("/api/resize-image", methods=["POST"])
+def api_resize_image():
+    if "file" not in request.files or not request.files["file"].filename:
+        return jsonify({"error": "No image file uploaded."}), 400
+    f = request.files["file"]
+    task_id = uuid.uuid4().hex[:12]
+    task_dir = Path(tempfile.gettempdir()) / "removix_tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(f.filename).name
+    in_path = task_dir / safe_name
+    f.save(str(in_path))
+
+    w = request.form.get("width")
+    h = request.form.get("height")
+    pct = request.form.get("percentage")
+    maintain = request.form.get("maintain_aspect", "true").lower() == "true"
+
+    width_val = int(w) if w and str(w).isdigit() else None
+    height_val = int(h) if h and str(h).isdigit() else None
+    pct_val = int(pct) if pct and str(pct).isdigit() else None
+
+    ext = Path(safe_name).suffix.lower()
+    if ext not in [".jpg", ".jpeg", ".png", ".webp"]:
+        ext = ".png"
+    out_path = task_dir / f"resized{ext}"
+    try:
+        resize_image(in_path, out_path, width=width_val, height=height_val, percentage=pct_val, maintain_aspect=maintain)
+        mime = "image/jpeg" if ext in [".jpg", ".jpeg"] else "image/png"
+        return send_file(
+            str(out_path),
+            as_attachment=True,
+            download_name=out_path.name,
+            mimetype=mime,
+        )
+    except Exception as e:
+        return jsonify({"error": "Could not resize image."}), 500
+
+
+@app.route("/api/crop-image", methods=["POST"])
+def api_crop_image():
+    if "file" not in request.files or not request.files["file"].filename:
+        return jsonify({"error": "No image file uploaded."}), 400
+    f = request.files["file"]
+    task_id = uuid.uuid4().hex[:12]
+    task_dir = Path(tempfile.gettempdir()) / "removix_tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(f.filename).name
+    in_path = task_dir / safe_name
+    f.save(str(in_path))
+    ratio = request.form.get("ratio", "1:1")
+    ext = Path(safe_name).suffix.lower()
+    if ext not in [".jpg", ".jpeg", ".png", ".webp"]:
+        ext = ".png"
+    out_path = task_dir / f"cropped{ext}"
+    try:
+        left = request.form.get("left")
+        top = request.form.get("top")
+        right = request.form.get("right")
+        bottom = request.form.get("bottom")
+        if left is not None and top is not None and right is not None and bottom is not None:
+            crop_image(
+                in_path,
+                out_path,
+                ratio=None,
+                left=int(float(left)),
+                top=int(float(top)),
+                right=int(float(right)),
+                bottom=int(float(bottom)),
+            )
+        else:
+            crop_image(in_path, out_path, ratio=ratio)
+        mime = "image/jpeg" if ext in [".jpg", ".jpeg"] else "image/png"
+        return send_file(
+            str(out_path),
+            as_attachment=True,
+            download_name=out_path.name,
+            mimetype=mime,
+        )
+    except Exception as e:
+        return jsonify({"error": "Could not crop image."}), 500
+
+
+@app.route("/api/compress-image", methods=["POST"])
+def api_compress_image():
+    if "file" not in request.files or not request.files["file"].filename:
+        return jsonify({"error": "No image file uploaded."}), 400
+    f = request.files["file"]
+    task_id = uuid.uuid4().hex[:12]
+    task_dir = Path(tempfile.gettempdir()) / "removix_tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(f.filename).name
+    in_path = task_dir / safe_name
+    f.save(str(in_path))
+    try:
+        quality = int(request.form.get("quality", 75))
+    except Exception:
+        quality = 75
+    ext = Path(safe_name).suffix.lower()
+    if ext not in [".jpg", ".jpeg", ".png", ".webp"]:
+        ext = ".jpg"
+    out_path = task_dir / f"compressed{ext}"
+    try:
+        compress_image(in_path, out_path, quality=quality)
+        mime = "image/jpeg" if ext in [".jpg", ".jpeg"] else "image/png"
+        return send_file(
+            str(out_path),
+            as_attachment=True,
+            download_name=out_path.name,
+            mimetype=mime,
+        )
+    except Exception as e:
+        return jsonify({"error": "Could not compress image."}), 500
+
+
+@app.route("/api/flip-image", methods=["POST"])
+def api_flip_image():
+    if "file" not in request.files or not request.files["file"].filename:
+        return jsonify({"error": "No image file uploaded."}), 400
+    f = request.files["file"]
+    task_id = uuid.uuid4().hex[:12]
+    task_dir = Path(tempfile.gettempdir()) / "removix_tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(f.filename).name
+    in_path = task_dir / safe_name
+    f.save(str(in_path))
+    direction = request.form.get("direction", "horizontal")
+    ext = Path(safe_name).suffix.lower()
+    if ext not in [".jpg", ".jpeg", ".png", ".webp"]:
+        ext = ".png"
+    out_path = task_dir / f"flipped{ext}"
+    try:
+        flip_image(in_path, out_path, direction=direction)
+        mime = "image/jpeg" if ext in [".jpg", ".jpeg"] else "image/png"
+        return send_file(
+            str(out_path),
+            as_attachment=True,
+            download_name=out_path.name,
+            mimetype=mime,
+        )
+    except Exception as e:
+        return jsonify({"error": "Could not flip image."}), 500
+
+
+@app.route("/api/black-white", methods=["POST"])
+def api_black_white():
+    if "file" not in request.files or not request.files["file"].filename:
+        return jsonify({"error": "No image file uploaded."}), 400
+    f = request.files["file"]
+    task_id = uuid.uuid4().hex[:12]
+    task_dir = Path(tempfile.gettempdir()) / "removix_tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(f.filename).name
+    in_path = task_dir / safe_name
+    f.save(str(in_path))
+    ext = Path(safe_name).suffix.lower()
+    if ext not in [".jpg", ".jpeg", ".png", ".webp"]:
+        ext = ".jpg"
+    out_path = task_dir / f"monochrome{ext}"
+    try:
+        convert_black_white(in_path, out_path)
+        mime = "image/jpeg" if ext in [".jpg", ".jpeg"] else "image/png"
+        return send_file(
+            str(out_path),
+            as_attachment=True,
+            download_name=out_path.name,
+            mimetype=mime,
+        )
+    except Exception as e:
+        return jsonify({"error": "Could not convert image."}), 500
+
+
+@app.route("/api/add-text-image", methods=["POST"])
+def api_add_text_image():
+    if "file" not in request.files or not request.files["file"].filename:
+        return jsonify({"error": "No image file uploaded."}), 400
+    f = request.files["file"]
+    task_id = uuid.uuid4().hex[:12]
+    task_dir = Path(tempfile.gettempdir()) / "removix_tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(f.filename).name
+    in_path = task_dir / safe_name
+    f.save(str(in_path))
+    text = request.form.get("text", "").strip()
+    placement = request.form.get("placement", "bottom_center")
+    try:
+        font_size = int(request.form.get("font_size", 36))
+    except Exception:
+        font_size = 36
+    color = request.form.get("color", "#ffffff")
+    ext = Path(safe_name).suffix.lower()
+    if ext not in [".jpg", ".jpeg", ".png", ".webp"]:
+        ext = ".png"
+    out_path = task_dir / f"captioned{ext}"
+    try:
+        add_text_to_image(in_path, out_path, text=text, placement=placement, font_size=font_size, color=color)
+        mime = "image/jpeg" if ext in [".jpg", ".jpeg"] else "image/png"
+        return send_file(
+            str(out_path),
+            as_attachment=True,
+            download_name=out_path.name,
+            mimetype=mime,
+        )
+    except Exception as e:
+        return jsonify({"error": "Could not add text to image."}), 500
+
+
+@app.route("/api/make-round-image", methods=["POST"])
+def api_make_round_image():
+    if "file" not in request.files or not request.files["file"].filename:
+        return jsonify({"error": "No image file uploaded."}), 400
+    f = request.files["file"]
+    task_id = uuid.uuid4().hex[:12]
+    task_dir = Path(tempfile.gettempdir()) / "removix_tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(f.filename).name
+    in_path = task_dir / safe_name
+    f.save(str(in_path))
+    out_path = task_dir / "round_avatar.png"
+    bg_color = request.form.get("bg_color", "transparent")
+    try:
+        make_round_image(in_path, out_path, bg_color=bg_color)
+        return send_file(
+            str(out_path),
+            as_attachment=True,
+            download_name=out_path.name,
+            mimetype="image/png",
+        )
+    except Exception as e:
+        return jsonify({"error": "Could not make round image."}), 500
+
+
+@app.route("/api/blur-background", methods=["POST"])
+def api_blur_background():
+    if "file" not in request.files or not request.files["file"].filename:
+        return jsonify({"error": "No image file uploaded."}), 400
+    f = request.files["file"]
+    task_id = uuid.uuid4().hex[:12]
+    task_dir = Path(tempfile.gettempdir()) / "removix_tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(f.filename).name
+    in_path = task_dir / safe_name
+    f.save(str(in_path))
+    try:
+        radius = int(request.form.get("radius", 18))
+    except Exception:
+        radius = 18
+    ext = Path(safe_name).suffix.lower()
+    if ext not in [".jpg", ".jpeg", ".png", ".webp"]:
+        ext = ".png"
+    out_path = task_dir / f"blurred{ext}"
+    try:
+        blur_background(in_path, out_path, radius=radius)
+        mime = "image/jpeg" if ext in [".jpg", ".jpeg"] else "image/png"
+        return send_file(
+            str(out_path),
+            as_attachment=True,
+            download_name=out_path.name,
+            mimetype=mime,
+        )
+    except Exception as e:
+        return jsonify({"error": "Could not process this image. Please try a different file."}), 500
+
+
+@app.route("/api/collage-maker", methods=["POST"])
+def api_collage_maker():
+    files = request.files.getlist("files") or request.files.getlist("images")
+    if not files or len(files) < 2:
+        return jsonify({"error": "Please provide at least 2 images for the collage."}), 400
+    task_id = uuid.uuid4().hex[:12]
+    task_dir = Path(tempfile.gettempdir()) / "removix_tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+    saved_paths = []
+    for idx, f in enumerate(files):
+        if f and f.filename:
+            safe_name = f"img_{idx}_{Path(f.filename).name}"
+            p = task_dir / safe_name
+            f.save(str(p))
+            saved_paths.append(p)
+    if len(saved_paths) < 2:
+        return jsonify({"error": "Please provide at least 2 images for the collage."}), 400
+    layout = request.form.get("layout", "grid")
+    out_path = task_dir / "removix_collage.jpg"
+    try:
+        make_collage(saved_paths, out_path, layout=layout)
+        return send_file(
+            str(out_path),
+            as_attachment=True,
+            download_name=out_path.name,
+            mimetype="image/jpeg",
+        )
+    except Exception as e:
+        return jsonify({"error": "Could not build photo collage."}), 500
+
+
+@app.route("/api/upscale-image", methods=["POST"])
+def api_upscale_image():
+    if "file" not in request.files or not request.files["file"].filename:
+        return jsonify({"error": "No image file uploaded."}), 400
+    f = request.files["file"]
+    task_id = uuid.uuid4().hex[:12]
+    task_dir = Path(tempfile.gettempdir()) / "removix_tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(f.filename).name
+    in_path = task_dir / safe_name
+    f.save(str(in_path))
+
+    # Enforce max 1MB limit as strictly requested in prompt
+    file_size = in_path.stat().st_size
+    if file_size > 1024 * 1024:
+        return jsonify({"error": "Please upload an image smaller than 1MB for best results."}), 400
+
+    ext = Path(safe_name).suffix.lower()
+    if ext not in [".jpg", ".jpeg", ".png", ".webp"]:
+        ext = ".png"
+    out_path = task_dir / f"upscaled{ext}"
+    try:
+        upscale_image(in_path, out_path, scale=2)
+        mime = "image/jpeg" if ext in [".jpg", ".jpeg"] else "image/png"
+        return send_file(
+            str(out_path),
+            as_attachment=True,
+            download_name=out_path.name,
+            mimetype=mime,
+        )
+    except Exception as e:
+        return jsonify({"error": "Could not enhance this image. Please try a different file."}), 500
+
+
+
+
+
+# =====================================================================
+# 4. STATIC ASSETS & FAVICONS
+# =====================================================================
 
 LOTTIE_FILE = BUNDLE_DIR / "lottie_scan.json"
 LOTTIE_JS_FILE = BUNDLE_DIR / "lottie.min.js"
 BEFORE_WEBP = BUNDLE_DIR / "before.webp"
 AFTER_WEBP = BUNDLE_DIR / "after.webp"
+REMOVIX_PNG = BUNDLE_DIR / "removix.png"
+REMOVIX_ICO = BUNDLE_DIR / "removix.ico"
+REMOVIX_SVG = BUNDLE_DIR / "removix.svg"
 
 
 @app.route("/api/animation.json")
@@ -1628,2948 +2036,177 @@ def get_lottie_animation():
     abort(404)
 
 
+ROOT_DIR = Path(__file__).resolve().parent
+HERO_SVG_FILE = ROOT_DIR / "ui" / "components" / "hero_illustration" / "Young_man_with_red_shirt_at_a_computer.svg"
+PREMIUM_LAPTOP_SVG_FILE = ROOT_DIR / "ui" / "components" / "premium_laptop" / "laptop.svg"
+
+@app.route("/static/Young_man_with_red_shirt_at_a_computer.svg")
+@app.route("/static/hero-illustration.svg")
+def get_hero_svg_illustration():
+    for p in [HERO_SVG_FILE, ROOT_DIR / "assets" / "images" / "Young_man_with_red_shirt_at_a_computer.svg", ROOT_DIR / "Young man with red shirt at a computer.svg"]:
+        if p.exists() and p.is_file():
+            return send_file(str(p), mimetype="image/svg+xml")
+    abort(404)
+
+
+@app.route("/static/laptop.svg")
+@app.route("/static/Laptop.svg")
+def get_premium_laptop_svg():
+    for p in [PREMIUM_LAPTOP_SVG_FILE, ROOT_DIR / "assets" / "images" / "laptop.svg", ROOT_DIR / "Laptop.svg"]:
+        if p.exists() and p.is_file():
+            return send_file(str(p), mimetype="image/svg+xml")
+    abort(404)
+
+
 @app.route("/lottie.min.js")
 def get_lottie_script():
-    if LOTTIE_JS_FILE.exists():
-        return send_file(LOTTIE_JS_FILE, mimetype="application/javascript")
+    for p in [LOTTIE_JS_FILE, ROOT_DIR / "lottie.min.js", Path.cwd() / "lottie.min.js"]:
+        if p.exists() and p.is_file():
+            return send_file(str(p), mimetype="application/javascript")
     abort(404)
 
 
 @app.route("/static/before.webp")
 @app.route("/before.webp")
 def get_before_img():
-    candidates = [
-        BEFORE_WEBP,
-        Path(__file__).resolve().parent / "before.webp",
-        Path.cwd() / "before.webp",
-        Path("/home/ubuntu/Removix/before.webp"),
-    ]
-    for p in candidates:
-        if p.exists() and p.is_file() and p.stat().st_size > 0:
-            resp = send_file(str(p), mimetype="image/webp")
-            resp.headers["Cache-Control"] = "public, max-age=86400"
-            return resp
+    for p in [BEFORE_WEBP, Path.cwd() / "before.webp"]:
+        if p.exists() and p.is_file():
+            return send_file(str(p), mimetype="image/webp")
     abort(404)
 
 
 @app.route("/static/after.webp")
 @app.route("/after.webp")
 def get_after_img():
-    candidates = [
-        AFTER_WEBP,
-        Path(__file__).resolve().parent / "after.webp",
-        Path.cwd() / "after.webp",
-        Path("/home/ubuntu/Removix/after.webp"),
-    ]
-    for p in candidates:
-        if p.exists() and p.is_file() and p.stat().st_size > 0:
-            resp = send_file(str(p), mimetype="image/webp")
-            resp.headers["Cache-Control"] = "public, max-age=86400"
-            return resp
+    for p in [AFTER_WEBP, Path.cwd() / "after.webp"]:
+        if p.exists() and p.is_file():
+            return send_file(str(p), mimetype="image/webp")
     abort(404)
-
-
-REMOVIX_PNG = BUNDLE_DIR / "removix.png"
-REMOVIX_ICO = BUNDLE_DIR / "removix.ico"
-REMOVIX_SVG = BUNDLE_DIR / "removix.svg"
 
 
 @app.route("/favicon.ico")
 def get_favicon_ico():
-    candidates = [
-        REMOVIX_ICO,
-        Path(__file__).resolve().parent / "removix.ico",
-        Path.cwd() / "removix.ico",
-        Path("/home/ubuntu/Removix/removix.ico"),
-    ]
-    for p in candidates:
-        if p.exists() and p.is_file() and p.stat().st_size > 0:
-            resp = send_file(str(p), mimetype="image/x-icon")
-            resp.headers["Cache-Control"] = "public, max-age=86400"
-            return resp
+    for p in [REMOVIX_ICO, Path.cwd() / "removix.ico"]:
+        if p.exists() and p.is_file():
+            return send_file(str(p), mimetype="image/x-icon")
     abort(404)
 
 
 @app.route("/static/removix.svg")
-@app.route("/static/removix-logo.svg")
 @app.route("/favicon.svg")
 def get_removix_svg():
-    candidates = [
-        REMOVIX_SVG,
-        Path(__file__).resolve().parent / "removix.svg",
-        Path.cwd() / "removix.svg",
-        Path("/home/ubuntu/Removix/removix.svg"),
-    ]
-    for p in candidates:
-        if p.exists() and p.is_file() and p.stat().st_size > 0:
-            resp = send_file(str(p), mimetype="image/svg+xml")
-            resp.headers["Cache-Control"] = "public, max-age=86400"
-            return resp
+    for p in [REMOVIX_SVG, Path.cwd() / "removix.svg"]:
+        if p.exists() and p.is_file():
+            return send_file(str(p), mimetype="image/svg+xml")
     if REMOVIX_PNG.exists():
-        resp = send_file(str(REMOVIX_PNG), mimetype="image/png")
-        resp.headers["Cache-Control"] = "public, max-age=86400"
-        return resp
+        return send_file(str(REMOVIX_PNG), mimetype="image/png")
     abort(404)
 
 
 @app.route("/static/removix.png")
-@app.route("/static/removix-logo.png")
 @app.route("/favicon.png")
 def get_removix_logo():
-    candidates = [
-        REMOVIX_PNG,
-        Path(__file__).resolve().parent / "removix.png",
-        Path.cwd() / "removix.png",
-        Path("/home/ubuntu/Removix/removix.png"),
-    ]
-    for p in candidates:
-        if p.exists() and p.is_file() and p.stat().st_size > 0:
-            resp = send_file(str(p), mimetype="image/png")
-            resp.headers["Cache-Control"] = "public, max-age=86400"
-            return resp
+    for p in [REMOVIX_PNG, Path.cwd() / "removix.png"]:
+        if p.exists() and p.is_file():
+            return send_file(str(p), mimetype="image/png")
     abort(404)
 
 
-PAGE = r"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Removix — AI Video & Image Watermark Remover</title>
-<link rel="icon" type="image/png" href="/static/removix.png?v=3">
-<link rel="shortcut icon" href="/favicon.ico?v=3">
-<link rel="apple-touch-icon" href="/static/removix.png?v=3">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-<script src="/lottie.min.js"></script>
-<script>
-  if (!window.lottie) {
-    var s = document.createElement('script');
-    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/lottie-web/5.12.2/lottie.min.js';
-    document.head.appendChild(s);
-  }
-</script>
-<style>
-  :root {
-    --primary: #0284c7;
-    --primary-hover: #0369a1;
-    --sky: #0ea5e9;
-    --sky-light: #e0f2fe;
-    --sky-soft: #f0f9ff;
-    --ink: #0f172a;
-    --ink-muted: #475569;
-    --ink-faint: #94a3b8;
-    --bg-page: #f8fafc;
-    --card-bg: #ffffff;
-    --line: #e2e8f0;
-    --line-subtle: #f1f5f9;
-    --green-badge: #16a34a;
-    --green-badge-bg: #dcfce7;
-    --radius-lg: 24px;
-    --radius-md: 16px;
-    --radius-sm: 10px;
-    --shadow-card: 0 20px 45px -12px rgba(15, 23, 42, 0.08), 0 4px 16px -2px rgba(15, 23, 42, 0.03);
-  }
-
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  html { scroll-behavior: smooth; }
-  body {
-    background-color: var(--bg-page);
-    background-image: radial-gradient(1200px 600px at 50% -80px, #e0f2fe 0%, rgba(240, 249, 255, 0.4) 45%, rgba(248, 250, 252, 0) 100%);
-    background-repeat: no-repeat;
-    color: var(--ink);
-    font-family: 'Plus Jakarta Sans', 'Inter', -apple-system, sans-serif;
-    -webkit-font-smoothing: antialiased;
-    overflow-x: hidden;
-  }
-
-  a { color: inherit; text-decoration: none; }
-
-  /* ---------- Clean Top Header (Removix) ---------- */
-  .top-header {
-    padding: 32px 20px 0;
-    display: flex;
-    justify-content: center;
-    align-items: center;
-  }
-  .brand-badge {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 0px;
-    background: #ffffff;
-    padding: 6px 20px 6px 16px;
-    border-radius: 9999px;
-    border: 1px solid rgba(226, 232, 240, 0.9);
-    box-shadow: 0 4px 16px rgba(15, 23, 42, 0.04);
-  }
-  .brand-icon {
-    width: 27px;
-    height: 27px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    overflow: visible;
-    flex-shrink: 0;
-  }
-  .brand-icon img, .brand-logo-img {
-    width: 100%;
-    height: 100%;
-    object-fit: contain;
-    display: block;
-  }
-  .brand-icon svg { width: 100%; height: 100%; display: block; }
-  .brand-name {
-    font-size: 21.5px;
-    font-weight: 800;
-    letter-spacing: -0.03em;
-    color: var(--ink);
-    line-height: 1;
-    margin-left: 0px;
-  }
-  .brand-name span { color: var(--sky); }
-
-  /* ---------- Hero Section ---------- */
-  .hero {
-    max-width: 820px;
-    margin: 40px auto 0;
-    text-align: center;
-    padding: 0 20px;
-  }
-  .badge-tag {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 11.5px;
-    font-weight: 700;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: #0284c7;
-    background: #eff6ff;
-    border: 1px solid #bfdbfe;
-    padding: 6px 16px;
-    border-radius: 9999px;
-    margin-bottom: 20px;
-  }
-  .hero h1 {
-    font-size: clamp(34px, 5.2vw, 56px);
-    font-weight: 800;
-    line-height: 1.12;
-    letter-spacing: -0.03em;
-    color: var(--ink);
-    margin-bottom: 16px;
-  }
-  .hero-sub {
-    font-size: 17px;
-    line-height: 1.6;
-    color: var(--ink-muted);
-    max-width: 620px;
-    margin: 0 auto 36px;
-  }
-  .hero-sub strong { color: var(--ink); font-weight: 600; }
-
-  /* ---------- Tool Card (Hero Main Box) ---------- */
-  .tool-container {
-    max-width: 860px;
-    width: 100%;
-    margin: 0 auto;
-    padding: 0 20px;
-    box-sizing: border-box;
-    overflow-x: hidden;
-  }
-  .main-tool-card {
-    background: var(--card-bg);
-    border: 1px solid rgba(226, 232, 240, 0.9);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-card);
-    padding: 32px;
-    position: relative;
-    overflow: hidden;
-    overflow-x: hidden;
-    width: 100%;
-    box-sizing: border-box;
-  }
-
-  /* Mode Switcher tabs */
-  .tool-tabs {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 10px;
-    margin-bottom: 24px;
-  }
-  .tool-tab {
-    padding: 9px 22px;
-    border-radius: 9999px;
-    font-size: 13.5px;
-    font-weight: 600;
-    color: var(--ink-muted);
-    background: #f1f5f9;
-    border: 1px solid transparent;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    transition: all 0.2s ease;
-  }
-  .tool-tab.active {
-    background: #eff6ff;
-    color: #0284c7;
-    border-color: #bae6fd;
-    box-shadow: 0 2px 8px rgba(2, 132, 199, 0.12);
-  }
-  .tool-tab:hover:not(.active) {
-    background: #e2e8f0;
-  }
-
-  /* Watermark Detection Zone Pills */
-  .zone-pills-bar {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 8px;
-    margin: 0 auto 20px;
-    flex-wrap: wrap;
-  }
-  .zone-label {
-    font-size: 13px;
-    font-weight: 600;
-    color: var(--ink-muted);
-  }
-  .zone-pill {
-    background: #f1f5f9;
-    border: 1px solid var(--line);
-    color: var(--ink-muted);
-    font-size: 12px;
-    font-weight: 600;
-    padding: 6px 14px;
-    border-radius: 9999px;
-    cursor: pointer;
-    transition: all 0.2s ease;
-    outline: none;
-    font-family: inherit;
-  }
-  .zone-pill:hover {
-    background: #e2e8f0;
-    color: var(--ink);
-  }
-  .zone-pill.active {
-    background: #0284c7;
-    color: #ffffff;
-    border-color: #0284c7;
-    box-shadow: 0 2px 8px rgba(2, 132, 199, 0.25);
-  }
-
-  /* Dropzone */
-  #dropzone {
-    border: 2px dashed #bae6fd;
-    background: #f8fafc;
-    border-radius: var(--radius-md);
-    padding: 34px 24px 26px;
-    text-align: center;
-    cursor: pointer;
-    display: block;
-    transition: all 0.25s ease;
-    user-select: none;
-    -webkit-user-select: none;
-  }
-  #dropzone:hover, #dropzone.hover {
-    border-color: var(--sky);
-    background: var(--sky-soft);
-  }
-
-  /* From Uiverse.io by 3bdel3ziz-T — Removix Sky Blue Edition */
-  .folder-container {
-    --transition: 350ms;
-    --folder-W: 120px;
-    --folder-H: 80px;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: flex-end;
-    padding: 10px;
-    background: linear-gradient(135deg, #38bdf8, #0284c7);
-    border-radius: 18px;
-    box-shadow: 0 15px 30px rgba(2, 132, 199, 0.28);
-    height: calc(var(--folder-H) * 1.7);
-    width: 210px;
-    margin: 14px auto 20px;
-    position: relative;
-    perspective: 600px;
-  }
-
-  .folder {
-    position: absolute;
-    top: -20px;
-    left: calc(50% - 60px);
-    animation: float 2.5s infinite ease-in-out;
-    transition: transform var(--transition) ease;
-  }
-
-  #dropzone:hover .folder,
-  .folder-container:hover .folder {
-    transform: scale(1.06);
-  }
-
-  .folder .front-side,
-  .folder .back-side {
-    position: absolute;
-    transition: transform var(--transition);
-    transform-origin: bottom center;
-  }
-
-  .folder .back-side::before,
-  .folder .back-side::after {
-    content: "";
-    display: block;
-    background-color: white;
-    opacity: 0.6;
-    z-index: 0;
-    width: var(--folder-W);
-    height: var(--folder-H);
-    position: absolute;
-    transform-origin: bottom center;
-    border-radius: 12px;
-    transition: transform 350ms;
-    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.08);
-  }
-
-  #dropzone:hover .back-side::before,
-  .folder-container:hover .back-side::before {
-    transform: rotateX(-5deg) skewX(5deg);
-  }
-  #dropzone:hover .back-side::after,
-  .folder-container:hover .back-side::after {
-    transform: rotateX(-15deg) skewX(12deg);
-  }
-
-  .folder .front-side {
-    z-index: 1;
-  }
-
-  #dropzone:hover .front-side,
-  .folder-container:hover .front-side {
-    transform: rotateX(-40deg) skewX(15deg);
-  }
-
-  .folder .tip {
-    background: linear-gradient(135deg, #ff9a56, #ff6f56);
-    width: 80px;
-    height: 20px;
-    border-radius: 12px 12px 0 0;
-    box-shadow: 0 5px 15px rgba(0, 0, 0, 0.15);
-    position: absolute;
-    top: -10px;
-    z-index: 2;
-  }
-
-  .folder .cover {
-    background: linear-gradient(135deg, #ffe563, #ffc663);
-    width: var(--folder-W);
-    height: var(--folder-H);
-    box-shadow: 0 15px 30px rgba(0, 0, 0, 0.22);
-    border-radius: 10px;
-  }
-
-  .custom-file-upload {
-    font-size: 14px;
-    font-weight: 700;
-    color: #ffffff;
-    text-align: center;
-    background: rgba(255, 255, 255, 0.22);
-    border: 1px solid rgba(255, 255, 255, 0.35);
-    border-radius: 10px;
-    box-shadow: 0 10px 20px rgba(0, 0, 0, 0.08);
-    cursor: pointer;
-    transition: background var(--transition) ease, transform 0.2s ease;
-    display: block;
-    width: 100%;
-    padding: 9px 18px;
-    position: relative;
-    z-index: 5;
-    pointer-events: auto;
-    text-decoration: none;
-    letter-spacing: 0.01em;
-  }
-
-  #dropzone:hover .custom-file-upload,
-  .custom-file-upload:hover {
-    background: rgba(255, 255, 255, 0.4);
-  }
-
-  @keyframes float {
-    0% {
-      transform: translateY(0px);
-    }
-    50% {
-      transform: translateY(-16px);
-    }
-    100% {
-      transform: translateY(0px);
-    }
-  }
-
-  .drop-primary {
-    font-size: 18px;
-    font-weight: 700;
-    color: var(--ink);
-    margin-bottom: 6px;
-  }
-  .drop-secondary {
-    font-size: 13px;
-    color: var(--ink-muted);
-  }
-  input[type=file] { display: none; }
-
-  /* ---------- Processing View ---------- */
-  .processing {
-    display: none;
-    width: 100%;
-    box-sizing: border-box;
-    overflow-x: hidden;
-  }
-  .processing.active {
-    display: block;
-    animation: fadeIn 0.3s ease;
-  }
-  @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
-
-  .processing-layout {
-    display: grid;
-    grid-template-columns: 1.15fr 0.85fr;
-    gap: 24px;
-    align-items: center;
-    width: 100%;
-    box-sizing: border-box;
-    overflow-x: hidden;
-  }
-  @media (max-width: 768px) {
-    .processing-layout {
-      grid-template-columns: 1fr;
-      justify-items: center;
-      gap: 20px;
-      overflow-x: hidden;
-    }
-  }
-
-  /* Left: Lottie Scanner Stage with Blurred Media Preview */
-  .lottie-scan-stage {
-    position: relative;
-    width: 90%;
-    max-width: 380px;
-    margin: 0 auto;
-    box-sizing: border-box;
-    border-radius: 24px;
-    background: rgba(255, 255, 255, 0.15);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
-    border: 1.5px solid #bae6fd;
-    padding: 24px 16px;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    box-shadow: 0 16px 36px -12px rgba(14, 165, 233, 0.12);
-    min-height: 330px;
-    text-align: center;
-    overflow: hidden;
-  }
-  .scan-bg-preview {
-    position: absolute;
-    inset: -12px;
-    background-size: cover;
-    background-position: center;
-    filter: blur(10px) brightness(0.96) saturate(1.1);
-    transform: scale(1.12);
-    opacity: 0;
-    transition: opacity 0.5s ease;
-    z-index: 0;
-    pointer-events: none;
-  }
-  .scan-bg-preview.has-image {
-    opacity: 0.6;
-  }
-  .scan-bg-overlay {
-    position: absolute;
-    inset: 0;
-    background: rgba(255, 255, 255, 0.15);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
-    z-index: 1;
-    pointer-events: none;
-  }
-  .scan-badge {
-    position: relative;
-    z-index: 2;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: #0284c7;
-    background: rgba(224, 242, 254, 0.92);
-    backdrop-filter: blur(8px);
-    padding: 5px 13px;
-    border-radius: 9999px;
-    margin-bottom: 8px;
-    border: 1px solid rgba(186, 230, 253, 0.7);
-    box-shadow: 0 2px 8px rgba(14, 165, 233, 0.15);
-  }
-  .scan-badge svg {
-    width: 13px;
-    height: 13px;
-    fill: none;
-    stroke: currentColor;
-    stroke-width: 2.2;
-  }
-  .lottie-container {
-    position: relative;
-    z-index: 2;
-    width: 100%;
-    max-width: 250px;
-    height: 140px;
-    margin: 0 auto;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    overflow: hidden;
-    box-sizing: border-box;
-  }
-  .lottie-container svg {
-    width: 100% !important;
-    height: 100% !important;
-    max-width: 100%;
-  }
-  .stage-title {
-    position: relative;
-    z-index: 2;
-    color: var(--ink);
-    font-size: 16px;
-    font-weight: 700;
-    margin-top: 6px;
-    margin-bottom: 3px;
-    word-break: break-word;
-    max-width: 100%;
-    box-sizing: border-box;
-  }
-  .stage-sub {
-    position: relative;
-    z-index: 2;
-    color: var(--ink-muted);
-    font-size: 12.5px;
-    max-width: 320px;
-    width: 100%;
-    margin: 0 auto 14px;
-    line-height: 1.4;
-    word-break: break-word;
-    box-sizing: border-box;
-  }
-  .scan-progress-box {
-    position: relative;
-    z-index: 2;
-    width: 100%;
-    max-width: 320px;
-    background: rgba(255, 255, 255, 0.88);
-    backdrop-filter: blur(12px);
-    border: 1px solid rgba(226, 232, 240, 0.95);
-    border-radius: 12px;
-    padding: 10px 14px;
-    box-shadow: 0 4px 16px rgba(15, 23, 42, 0.06);
-    box-sizing: border-box;
-  }
-  .scan-progress-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--ink-muted);
-    margin-bottom: 7px;
-  }
-  .scan-pct-value {
-    font-size: 13px;
-    font-weight: 800;
-    color: var(--primary);
-    font-variant-numeric: tabular-nums;
-  }
-  .scan-progress-track {
-    width: 100%;
-    height: 7px;
-    background: #e2e8f0;
-    border-radius: 999px;
-    overflow: hidden;
-  }
-  .scan-progress-bar {
-    height: 100%;
-    width: 0%;
-    background: linear-gradient(90deg, #0ea5e9 0%, #0284c7 100%);
-    border-radius: 999px;
-    transition: width 0.35s ease;
-  }
-
-  /* Right Side: Details & Progress Chips */
-  .processing-details {
-    padding: 10px;
-    text-align: left;
-  }
-  .status-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 7px;
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: #0284c7;
-    background: #e0f2fe;
-    padding: 5px 12px;
-    border-radius: 9999px;
-    margin-bottom: 12px;
-  }
-  .status-dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: #0284c7;
-    animation: pulseDot 1.4s infinite;
-  }
-  @keyframes pulseDot { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.4; transform: scale(0.8); } }
-
-  .details-title {
-    font-size: 21px;
-    font-weight: 700;
-    color: var(--ink);
-    line-height: 1.25;
-    margin-bottom: 8px;
-  }
-  .details-sub {
-    font-size: 13.5px;
-    color: var(--ink-muted);
-    line-height: 1.55;
-    margin-bottom: 22px;
-  }
-
-  /* Step track */
-  .step-track {
-    display: flex;
-    flex-direction: column;
-    gap: 9px;
-  }
-  .step-chip-row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    font-size: 13px;
-    font-weight: 600;
-    color: var(--ink-faint);
-  }
-  .chip-indicator {
-    width: 22px;
-    height: 22px;
-    border-radius: 50%;
-    border: 1.5px solid var(--line);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 10px;
-    font-weight: 700;
-    background: #fff;
-    color: var(--ink-faint);
-    transition: all 0.2s ease;
-  }
-  .step-chip-row.active {
-    color: var(--primary);
-  }
-  .step-chip-row.active .chip-indicator {
-    border-color: var(--primary);
-    background: var(--sky-soft);
-    color: var(--primary);
-  }
-  .step-chip-row.done {
-    color: var(--ink);
-  }
-  .step-chip-row.done .chip-indicator {
-    border-color: #10b981;
-    background: #10b981;
-    color: #fff;
-  }
-
-  /* Mobile Responsiveness for Processing UI Box (320px - 540px) */
-  @media (max-width: 540px) {
-    .tool-container {
-      padding: 0 12px;
-    }
-    .main-tool-card {
-      padding: 20px 12px;
-      border-radius: 18px;
-    }
-    .lottie-scan-stage {
-      width: 90%;
-      max-width: 380px;
-      margin: 0 auto;
-      padding: 20px 12px;
-    }
-    .processing-details {
-      width: 90%;
-      max-width: 380px;
-      margin: 16px auto 0;
-      padding: 4px;
-    }
-  }
-
-  @media (max-width: 375px) {
-    .tool-container {
-      padding: 0 6px;
-    }
-    .main-tool-card {
-      padding: 14px 6px;
-      border-radius: 14px;
-    }
-    .lottie-scan-stage {
-      width: 90%;
-      max-width: 380px;
-      margin: 0 auto;
-      padding: 16px 8px;
-    }
-    .scan-progress-box {
-      padding: 8px 10px;
-    }
-    .processing-details {
-      width: 90%;
-      max-width: 380px;
-      margin: 12px auto 0;
-    }
-  }
-
-  @media (max-width: 330px) {
-    .tool-container {
-      padding: 0 4px;
-    }
-    .main-tool-card {
-      padding: 12px 4px;
-    }
-    .lottie-scan-stage {
-      width: 92%;
-      padding: 14px 6px;
-    }
-  }
-
-  /* ---------- Result View ---------- */
-  .result {
-    display: none;
-    text-align: center;
-    padding: 24px 0;
-  }
-  .result.active {
-    display: block;
-    animation: fadeIn 0.3s ease;
-  }
-  .result-icon-circle {
-    width: 68px;
-    height: 68px;
-    background: #dcfce7;
-    border-radius: 50%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    margin: 0 auto 16px;
-    color: #16a34a;
-  }
-  .result-icon-circle svg { width: 34px; height: 34px; fill: none; stroke: currentColor; stroke-width: 2.5; }
-  .result h3 {
-    font-size: 23px;
-    font-weight: 700;
-    color: var(--ink);
-    margin-bottom: 6px;
-  }
-  .result p {
-    font-size: 14.5px;
-    color: var(--ink-muted);
-    margin-bottom: 24px;
-  }
-  .result-actions {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 16px;
-    flex-wrap: wrap;
-    margin-top: 14px;
-  }
-  /* From Uiverse.io by nazar-gavrylyk */ 
-  .container {
-    padding: 0;
-    margin: 0;
-    box-sizing: border-box;
-    display: flex;
-    justify-content: center;
-    align-items: center;
-  }
-
-  .label {
-    background-color: #0f172a;
-    border: 2px solid rgb(91, 91, 240);
-    display: flex;
-    align-items: center;
-    border-radius: 50px;
-    width: 160px;
-    height: 57px;
-    cursor: pointer;
-    transition: all 0.4s ease;
-    padding: 5px;
-    position: relative;
-    user-select: none;
-    -webkit-user-select: none;
-    box-sizing: border-box;
-  }
-
-  .label::before {
-    content: "";
-    position: absolute;
-    top: 0;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    background-color: #fff;
-    width: 8px;
-    height: 8px;
-    transition: all 0.4s ease;
-    border-radius: 100%;
-    margin: auto;
-    opacity: 0;
-    visibility: hidden;
-  }
-
-  .label .input {
-    display: none;
-  }
-
-  .label .title {
-    font-size: 16px;
-    font-weight: 700;
-    color: #fff;
-    transition: all 0.4s ease;
-    position: absolute;
-    right: 18px;
-    top: 50%;
-    transform: translateY(-50%);
-    text-align: center;
-    margin: 0;
-    line-height: 1;
-  }
-
-  .label .title:last-child {
-    opacity: 0;
-    visibility: hidden;
-  }
-
-  .label .circle {
-    height: 45px;
-    width: 45px;
-    border-radius: 50%;
-    background-color: rgb(91, 91, 240);
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    transition: all 0.4s ease;
-    position: relative;
-    box-shadow: 0 0 0 0 rgb(255, 255, 255);
-    overflow: hidden;
-    flex-shrink: 0;
-  }
-
-  .label .circle .icon {
-    color: #fff;
-    width: 26px;
-    height: 26px;
-    position: absolute;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    transition: all 0.4s ease;
-  }
-
-  .label .circle .square {
-    aspect-ratio: 1;
-    width: 15px;
-    border-radius: 2px;
-    background-color: #fff;
-    opacity: 0;
-    visibility: hidden;
-    position: absolute;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    transition: all 0.4s ease;
-  }
-
-  .label .circle::before {
-    content: "";
-    position: absolute;
-    left: 0;
-    top: 0;
-    background-color: #3333a8;
-    width: 100%;
-    height: 0;
-    transition: all 0.4s ease;
-  }
-
-  .label:has(.input:checked),
-  .label.is-checked {
-    width: 57px;
-    animation: installed 0.35s ease 2s forwards;
-  }
-
-  .label:has(.input:checked)::before,
-  .label.is-checked::before {
-    animation: rotate 1.8s ease-in-out 0.2s forwards;
-  }
-
-  .label .input:checked + .circle,
-  .label.is-checked .circle {
-    animation:
-      pulse 0.8s forwards,
-      circleDelete 0.2s ease 2s forwards;
-    rotate: 180deg;
-  }
-
-  .label .input:checked + .circle::before,
-  .label.is-checked .circle::before {
-    animation: installing 1.8s ease-in-out forwards;
-  }
-
-  .label .input:checked + .circle .icon,
-  .label.is-checked .circle .icon {
-    opacity: 0;
-    visibility: hidden;
-  }
-
-  .label .input:checked ~ .circle .square,
-  .label.is-checked ~ .circle .square {
-    opacity: 1;
-    visibility: visible;
-  }
-
-  .label .input:checked ~ .title,
-  .label.is-checked ~ .title {
-    opacity: 0;
-    visibility: hidden;
-  }
-
-  .label .input:checked ~ .title:last-child,
-  .label.is-checked ~ .title:last-child {
-    animation: showInstalledMessage 0.35s ease 2s forwards;
-  }
-
-  @keyframes pulse {
-    0% {
-      scale: 0.95;
-      box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.7);
-    }
-    70% {
-      scale: 1;
-      box-shadow: 0 0 0 16px rgba(255, 255, 255, 0);
-    }
-    100% {
-      scale: 0.95;
-      box-shadow: 0 0 0 0 rgba(255, 255, 255, 0);
-    }
-  }
-
-  @keyframes installing {
-    from {
-      height: 0;
-    }
-    to {
-      height: 100%;
-    }
-  }
-
-  @keyframes rotate {
-    0% {
-      transform: rotate(-90deg) translate(27px) rotate(0);
-      opacity: 1;
-      visibility: visible;
-    }
-    99% {
-      transform: rotate(270deg) translate(27px) rotate(270deg);
-      opacity: 1;
-      visibility: visible;
-    }
-    100% {
-      opacity: 0;
-      visibility: hidden;
-    }
-  }
-
-  @keyframes installed {
-    100% {
-      width: 150px;
-      border-color: rgb(35, 174, 35);
-    }
-  }
-
-  @keyframes circleDelete {
-    100% {
-      opacity: 0;
-      visibility: hidden;
-    }
-  }
-
-  @keyframes showInstalledMessage {
-    100% {
-      opacity: 1;
-      visibility: visible;
-      right: 56px;
-    }
-  }
-  .btn-reset {
-    background: #ffffff;
-    color: var(--ink);
-    border: 2px solid #cbd5e1;
-    font-size: 15.5px;
-    font-weight: 700;
-    height: 57px;
-    padding: 0 28px;
-    border-radius: 50px;
-    cursor: pointer;
-    transition: all 0.25s ease;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 9px;
-    box-sizing: border-box;
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
-    line-height: 1;
-    margin: 0;
-  }
-  .btn-reset:hover {
-    background: #f8fafc;
-    border-color: #94a3b8;
-    transform: translateY(-1px);
-    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.08);
-  }
-  .btn-reset svg {
-    width: 17px;
-    height: 17px;
-    stroke: currentColor;
-    fill: none;
-    stroke-width: 2.2;
-    transition: transform 0.3s ease;
-  }
-  .btn-reset:hover svg {
-    transform: rotate(-45deg);
-  }
-
-  /* Error Box */
-  .error-box {
-    display: none;
-    background: #fef2f2;
-    border: 1px solid #fecaca;
-    color: #dc2626;
-    border-radius: var(--radius-sm);
-    padding: 14px 18px;
-    font-size: 14px;
-    text-align: left;
-    margin-top: 20px;
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
-  .error-box.active { display: block; }
-
-  /* ---------- Feature Cards (Image 4) ---------- */
-  .section-features {
-    max-width: 980px;
-    margin: 80px auto 0;
-    padding: 0 20px;
-    text-align: center;
-  }
-  .features-grid {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 20px;
-    margin-bottom: 24px;
-  }
-  @media (max-width: 768px) {
-    .features-grid { grid-template-columns: 1fr; }
-  }
-  .feature-box {
-    background: #ffffff;
-    border: 1px solid #e2e8f0;
-    border-radius: var(--radius-md);
-    padding: 26px;
-    text-align: left;
-    box-shadow: 0 4px 20px rgba(15, 23, 42, 0.03);
-    transition: transform 0.2s ease, box-shadow 0.2s ease;
-  }
-  .feature-box:hover {
-    transform: translateY(-3px);
-    box-shadow: 0 10px 25px rgba(15, 23, 42, 0.06);
-  }
-  .feature-top {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 20px;
-  }
-  .feature-icon-pill {
-    width: 44px;
-    height: 44px;
-    border-radius: 12px;
-    background: #f0f9ff;
-    color: #0284c7;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-  .feature-icon-pill svg { width: 22px; height: 22px; stroke: currentColor; fill: none; stroke-width: 2; }
-
-  .free-badge {
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 0.05em;
-    color: var(--green-badge);
-    background: var(--green-badge-bg);
-    padding: 4px 10px;
-    border-radius: 9999px;
-    text-transform: uppercase;
-  }
-  .feature-box h3 {
-    font-size: 17px;
-    font-weight: 700;
-    color: var(--ink);
-    margin-bottom: 8px;
-  }
-  .feature-box p {
-    font-size: 13.5px;
-    color: var(--ink-muted);
-    line-height: 1.6;
-  }
-  .features-footer-caption {
-    font-size: 13.5px;
-    color: var(--ink-muted);
-    margin-top: 14px;
-  }
-
-  /* ---------- Before & After Section (Image 5) ---------- */
-  .section-comparison {
-    max-width: 980px;
-    margin: 90px auto 0;
-    padding: 0 20px;
-  }
-  .comparison-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 48px;
-    align-items: center;
-  }
-  @media (max-width: 800px) {
-    .comparison-grid { grid-template-columns: 1fr; gap: 32px; }
-  }
-  .comp-label {
-    font-size: 11px;
-    font-weight: 800;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: #4f46e5;
-    margin-bottom: 12px;
-    display: inline-block;
-  }
-  .comp-title {
-    font-size: clamp(28px, 3.6vw, 40px);
-    font-weight: 800;
-    color: var(--ink);
-    letter-spacing: -0.02em;
-    line-height: 1.2;
-    margin-bottom: 18px;
-  }
-  .comp-desc {
-    font-size: 15px;
-    color: var(--ink-muted);
-    line-height: 1.65;
-    margin-bottom: 28px;
-  }
-  .comp-desc strong {
-    color: var(--ink);
-  }
-  .comp-stats {
-    display: flex;
-    gap: 28px;
-    flex-wrap: wrap;
-    padding-top: 18px;
-    border-top: 1px solid var(--line);
-  }
-  .comp-stat-item h4 {
-    font-size: 16px;
-    font-weight: 800;
-    color: #4f46e5;
-    margin-bottom: 2px;
-  }
-  .comp-stat-item p {
-    font-size: 12px;
-    color: var(--ink-muted);
-  }
-
-  /* Comparison Visual Interactive Split Slider */
-  .comp-visuals-wrapper {
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    width: 100%;
-    padding: 0;
-    margin: 0;
-  }
-
-  /* ---------- Interactive Split Curtain Comparison Slider ---------- */
-  .split-slider-container {
-    position: relative;
-    width: 100%;
-    margin: 0 auto;
-    padding: 0;
-    border-radius: 18px;
-    overflow: hidden;
-    box-shadow: 0 16px 38px -8px rgba(15, 23, 42, 0.18), 0 0 0 1px rgba(226, 232, 240, 0.9);
-    user-select: none;
-    -webkit-user-select: none;
-    touch-action: none;
-    cursor: ew-resize;
-    background: transparent !important;
-  }
-  #homepage-split-slider {
-    width: 100%;
-    max-width: 440px;
-    aspect-ratio: 4 / 5;
-    padding: 0;
-    margin: 0 auto;
-    overflow: hidden;
-    background: transparent !important;
-  }
-  #user-split-slider {
-    width: 100%;
-    max-width: 620px;
-    padding: 0;
-    margin: 0 auto;
-    overflow: hidden;
-    background: transparent !important;
-  }
-
-  /* Result Mode Switcher (Compare Slider vs Box Eraser) */
-  .result-mode-bar {
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    gap: 10px;
-    margin: 0 auto 16px;
-    flex-wrap: wrap;
-  }
-  .mode-btn {
-    padding: 8px 20px;
-    border-radius: 9999px;
-    font-size: 13px;
-    font-weight: 700;
-    color: var(--ink-muted);
-    background: #f1f5f9;
-    border: 1px solid var(--line);
-    cursor: pointer;
-    display: inline-flex;
-    align-items: center;
-    gap: 7px;
-    transition: all 0.2s ease;
-    font-family: inherit;
-    outline: none;
-  }
-  .mode-btn:hover {
-    background: #e2e8f0;
-    color: var(--ink);
-  }
-  .mode-btn.active {
-    background: #0284c7;
-    color: #ffffff;
-    border-color: #0284c7;
-    box-shadow: 0 2px 10px rgba(2, 132, 199, 0.28);
-  }
-  .mode-btn svg {
-    width: 15px;
-    height: 15px;
-    stroke: currentColor;
-    fill: none;
-  }
-
-  /* Interactive Box Eraser Overlay */
-  .box-draw-overlay {
-    position: absolute;
-    inset: 0;
-    z-index: 30;
-    cursor: crosshair;
-    user-select: none;
-    -webkit-user-select: none;
-  }
-  .box-selection-rect {
-    position: absolute;
-    border: 2px dashed #0284c7;
-    background: rgba(14, 165, 233, 0.22);
-    border-radius: 5px;
-    pointer-events: none;
-    box-shadow: 0 0 12px rgba(2, 132, 199, 0.4);
-    box-sizing: border-box;
-  }
-  .box-floating-bar {
-    position: absolute;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    background: #0f172a;
-    border: 1px solid rgba(255, 255, 255, 0.18);
-    color: #ffffff;
-    padding: 4px 6px;
-    border-radius: 8px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
-    font-size: 12px;
-    font-weight: 600;
-    z-index: 50;
-    white-space: nowrap;
-    box-sizing: border-box;
-    cursor: grab;
-    user-select: none;
-    -webkit-user-select: none;
-    touch-action: none;
-  }
-  .box-floating-bar:active {
-    cursor: grabbing;
-  }
-  .removix-toast {
-    position: fixed;
-    bottom: 30px;
-    left: 50%;
-    transform: translateX(-50%) translateY(30px);
-    background: #0f172a;
-    color: #38bdf8;
-    border: 1px solid rgba(56, 189, 248, 0.4);
-    padding: 11px 24px;
-    border-radius: 9999px;
-    font-size: 13.5px;
-    font-weight: 700;
-    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
-    opacity: 0;
-    pointer-events: none;
-    transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
-    z-index: 99999;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .removix-toast.show {
-    opacity: 1;
-    transform: translateX(-50%) translateY(0);
-  }
-  .btn-box-erase {
-    background: #0284c7;
-    color: #ffffff;
-    border: none;
-    padding: 5px 12px;
-    border-radius: 6px;
-    cursor: pointer;
-    font-size: 12px;
-    font-weight: 700;
-    transition: background 0.15s ease;
-    font-family: inherit;
-  }
-  .btn-box-erase:hover {
-    background: #0369a1;
-  }
-  .btn-box-cancel {
-    background: transparent;
-    color: #94a3b8;
-    border: none;
-    cursor: pointer;
-    font-size: 15px;
-    padding: 0 4px;
-    line-height: 1;
-  }
-  .btn-box-cancel:hover {
-    color: #ffffff;
-  }
-  .box-hint-badge {
-    position: absolute;
-    top: 14px;
-    left: 50%;
-    transform: translateX(-50%);
-    background: rgba(15, 23, 42, 0.85);
-    backdrop-filter: blur(6px);
-    color: #ffffff;
-    font-size: 12.5px;
-    font-weight: 600;
-    padding: 5px 16px;
-    border-radius: 9999px;
-    pointer-events: none;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.2);
-    z-index: 40;
-  }
-  .split-layer {
-    position: absolute;
-    inset: 0;
-    width: 100%;
-    height: 100%;
-    overflow: hidden;
-    padding: 0;
-    margin: 0;
-    background: transparent !important;
-  }
-  .split-slider-container img,
-  .split-layer img,
-  .split-img {
-    position: absolute;
-    inset: 0;
-    width: 100% !important;
-    height: 100% !important;
-    object-fit: cover !important;
-    object-position: center !important;
-    display: block;
-    pointer-events: none;
-    background: transparent !important;
-  }
-  #homepage-split-slider img,
-  #homepage-split-slider .split-img {
-    object-position: center 80% !important;
-  }
-  .split-before {
-    clip-path: polygon(0 0, 50% 0, 50% 100%, 0 100%);
-    z-index: 2;
-  }
-  .split-after {
-    clip-path: polygon(50% 0, 100% 0, 100% 100%, 50% 100%);
-    z-index: 2;
-  }
-  .split-handle {
-    position: absolute;
-    top: 0;
-    bottom: 0;
-    left: 50%;
-    transform: translateX(-50%);
-    pointer-events: none;
-    z-index: 5;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-  .split-line {
-    position: absolute;
-    top: 0;
-    bottom: 0;
-    width: 2.5px;
-    background: #ffffff;
-    box-shadow: 0 0 8px rgba(0, 0, 0, 0.5);
-  }
-  .split-knob {
-    width: 38px;
-    height: 38px;
-    background: #ffffff;
-    border-radius: 50%;
-    box-shadow: 0 4px 16px rgba(2, 132, 199, 0.4), 0 0 0 2px #0ea5e9;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: #0284c7;
-    z-index: 6;
-  }
-  .split-knob svg {
-    width: 18px;
-    height: 18px;
-    stroke: currentColor;
-    stroke-width: 2.5;
-    fill: none;
-  }
-  .split-label {
-    position: absolute;
-    bottom: 12px;
-    padding: 4px 10px;
-    border-radius: 6px;
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 0.03em;
-    pointer-events: none;
-    backdrop-filter: blur(8px);
-    z-index: 4;
-  }
-  .before-label {
-    left: 12px;
-    background: rgba(15, 23, 42, 0.75);
-    color: #f8fafc;
-    border: 1px solid rgba(255, 255, 255, 0.15);
-  }
-  .after-label {
-    right: 12px;
-    background: rgba(2, 132, 199, 0.85);
-    color: #ffffff;
-    border: 1px solid rgba(255, 255, 255, 0.25);
-  }
-  .split-range {
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    opacity: 0;
-    cursor: ew-resize;
-    z-index: 10;
-    margin: 0;
-    padding: 0;
-    pointer-events: none;
-  }
-
-  /* Result-specific slider wrap */
-  .result-slider-container {
-    margin: 18px auto 20px;
-    max-width: 620px;
-  }
-
-  /* Removix Deep Clean Audit Card */
-  .audit-card {
-    max-width: 520px;
-    margin: 18px auto 20px;
-    background: #f8fafc;
-    border: 1px solid #e2e8f0;
-    border-radius: 16px;
-    padding: 16px 18px;
-    text-align: left;
-    box-shadow: 0 4px 14px rgba(15, 23, 42, 0.03);
-  }
-  .audit-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 12px;
-    padding-bottom: 10px;
-    border-bottom: 1px solid #e2e8f0;
-  }
-  .audit-badge-pill {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 13px;
-    font-weight: 700;
-    color: #0369a1;
-  }
-  .audit-badge-pill svg {
-    width: 16px;
-    height: 16px;
-    stroke: currentColor;
-    stroke-width: 2.2;
-    fill: none;
-  }
-  .audit-status-tag {
-    font-size: 11.5px;
-    font-weight: 700;
-    color: #15803d;
-    background: #dcfce7;
-    padding: 3px 8px;
-    border-radius: 999px;
-  }
-  .audit-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 10px;
-  }
-  @media (max-width: 540px) {
-    .audit-grid { grid-template-columns: 1fr; }
-  }
-  .audit-item {
-    display: flex;
-    align-items: flex-start;
-    gap: 8px;
-  }
-  .audit-check {
-    width: 18px;
-    height: 18px;
-    border-radius: 50%;
-    background: #0284c7;
-    color: #fff;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 11px;
-    font-weight: 800;
-    flex-shrink: 0;
-    margin-top: 1px;
-  }
-  .audit-item strong {
-    display: block;
-    font-size: 12px;
-    font-weight: 700;
-    color: var(--ink);
-    line-height: 1.25;
-  }
-  .audit-item small {
-    display: block;
-    font-size: 11px;
-    color: var(--ink-muted);
-    line-height: 1.3;
-    margin-top: 2px;
-  }
-
-  /* ---------- Privacy / Local Processing Section (Image 2) ---------- */
-  .section-privacy {
-    max-width: 980px;
-    margin: 100px auto 0;
-    padding: 0 20px;
-    text-align: center;
-  }
-  .privacy-title {
-    font-size: clamp(28px, 4vw, 42px);
-    font-weight: 800;
-    letter-spacing: -0.02em;
-    color: var(--ink);
-    margin-bottom: 40px;
-  }
-  .privacy-grid {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 20px;
-    text-align: left;
-  }
-  @media (max-width: 768px) {
-    .privacy-grid { grid-template-columns: 1fr; }
-  }
-  .privacy-card {
-    background: #ffffff;
-    border: 1px solid #e2e8f0;
-    border-radius: var(--radius-md);
-    padding: 30px 26px;
-    box-shadow: 0 4px 18px rgba(15, 23, 42, 0.03);
-    transition: transform 0.2s ease, box-shadow 0.2s ease;
-  }
-  .privacy-card:hover {
-    transform: translateY(-3px);
-    box-shadow: 0 10px 25px rgba(15, 23, 42, 0.06);
-  }
-  .privacy-icon-box {
-    width: 42px;
-    height: 42px;
-    border-radius: 10px;
-    background: #ecfdf5;
-    color: #10b981;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    margin-bottom: 20px;
-  }
-  .privacy-icon-box svg { width: 22px; height: 22px; stroke: currentColor; fill: none; stroke-width: 2; }
-  .privacy-card h3 {
-    font-size: 17px;
-    font-weight: 700;
-    color: var(--ink);
-    margin-bottom: 10px;
-  }
-  .privacy-card p {
-    font-size: 13.5px;
-    color: var(--ink-muted);
-    line-height: 1.6;
-  }
-
-  /* ---------- Professional Developer Footer ---------- */
-  footer.site-footer {
-    max-width: 980px;
-    margin: 80px auto 45px;
-    padding: 24px 20px;
-    border-top: 1px solid #e2e8f0;
-    text-align: center;
-  }
-  .copyright-text {
-    color: var(--ink-muted);
-    font-size: 14px;
-    font-weight: 500;
-    letter-spacing: 0.01em;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
-  .dev-link {
-    color: var(--primary);
-    font-weight: 700;
-    text-decoration: none;
-    padding: 4px 10px;
-    border-radius: 8px;
-    background: #e0f2fe;
-    transition: all 0.2s ease;
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-  }
-  .dev-link:hover {
-    background: var(--primary);
-    color: #ffffff;
-    transform: translateY(-1px);
-    box-shadow: 0 4px 12px rgba(2, 132, 199, 0.25);
-  }
-  .dev-link svg {
-    width: 13px;
-    height: 13px;
-    stroke: currentColor;
-    fill: none;
-    stroke-width: 2.2;
-    transition: transform 0.2s ease;
-  }
-  .dev-link:hover svg {
-    transform: translate(1px, -1px);
-  }
-</style>
-</head>
-<body>
-
-<!-- Clean Removix Header -->
-<header class="top-header">
-  <div class="brand-badge">
-    <div class="brand-icon">
-      <svg class="brand-logo-img" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="Removix Logo">
-        <path d="m56.693 463.048c-12.974-15.793-15.047-37.869-5.237-55.796 7.387-13.498 13.718-28.467 18.996-44.911 9.16-28.554 16.229-57.886 21.215-87.986 4.976-30.102 8.16-59.045 9.561-86.829 1.391-27.786 2.091-50.94 2.091-69.463v-17.945h-23.568c-25.597 0-46.348-20.733-46.348-46.309 0-25.576 20.751-46.309 46.348-46.309h365.69c18.311 0 33.156 14.832 33.156 33.128v219.107c0 19.264-15.63 34.88-34.91 34.88h-1.594c-26.693 0-52.23-9.646-73.216-26.128-5.323-4.181-11.823-6.868-18.916-6.868-10.513 0-18.432 9.689-16.181 19.95 1.927 8.786 4.385 17.186 7.375 25.201 5.172 13.893 11.448 26.827 18.824 38.783 7.367 11.967 15.433 22.776 24.201 32.417 8.759 9.65 17.527 18.333 26.294 26.049 5.929 5.303 12.022 10.337 18.278 15.102 23.655 18.016 25.408 52.931 3.447 72.974-16.147 14.737-40.248 16.513-58.465 4.422-14.352-9.525-27.302-19.711-38.853-30.56-19.719-18.524-36.452-37.916-50.195-58.176-13.745-20.26-24.706-40.808-32.867-61.648-8.17-20.84-14.342-40.809-18.526-59.913-4.182-19.101-6.974-36.557-8.364-52.386-1.401-15.82-2.093-29.133-2.093-39.942 0-3.853 0-7.326 0-10.42 0-3.084.196-5.589.599-7.524 0-2.316.195-4.432.597-6.368h124.194c19.198 0 34.761-15.55 34.761-34.732 0-19.182-15.563-34.732-34.761-34.732h-111.621c-19.401 0-35.047 15.868-34.757 35.25l.07 4.69c0 33.575-1.494 64.643-4.482 93.197-2.988 28.563-6.871 54.901-11.652 79.014-4.781 24.123-10.158 45.93-16.134 65.412-5.976 19.491-12.158 36.757-18.526 51.807-3.388 8.158-6.881 15.979-10.478 23.464-15.872 33.026-60.69 38.415-83.953 10.098z" fill="#0ea5e9"/>
-      </svg>
-    </div>
-    <span class="brand-name">emovix</span>
-  </div>
-</header>
-
-<!-- Hero Section -->
-<section class="hero">
-  <div class="badge-tag">
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L14.4 9.6L22 12L14.4 14.4L12 22L9.6 14.4L2 12L9.6 9.6L12 2Z"/></svg>
-    REMOVIX • AI WATERMARK REMOVER
-  </div>
-  <h1>Removix Watermark Remover</h1>
-  <p class="hero-sub">
-    Drop any AI <strong>video or image</strong> and the watermark is gone in seconds — every frame, original quality, ready to post.
-  </p>
-</section>
-
-<!-- Interactive Tool Container -->
-<section class="tool-container" id="tool-section">
-  <div class="main-tool-card">
-
-    <!-- Mode Selector Tabs -->
-    <div class="tool-tabs" id="tool-tabs">
-      <button class="tool-tab active" id="tab-video" onclick="setMode('video')">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="2" y1="17" x2="7" y2="17"/><line x1="17" y1="17" x2="22" y2="17"/><line x1="17" y1="7" x2="22" y2="7"/></svg>
-        Video Remover
-      </button>
-      <button class="tool-tab" id="tab-image" onclick="setMode('image')">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
-        Image Remover
-      </button>
-    </div>
-
-    <!-- Watermark Target Zone Selector -->
-    <div class="zone-pills-bar" id="zone-pills-bar">
-      <span class="zone-label">Target Area:</span>
-      <button type="button" class="zone-pill active" id="pill-auto" onclick="setZone('auto')">Auto AI Detect (All Tools)</button>
-      <button type="button" class="zone-pill" id="pill-br" onclick="setZone('bottom-right')">Bottom-Right Corner</button>
-      <button type="button" class="zone-pill" id="pill-bl" onclick="setZone('bottom-left')">Bottom-Left Corner</button>
-    </div>
-
-    <!-- Dropzone View (3D Floating Folder Animation by 3bdel3ziz-T) -->
-    <div id="dropzone" tabindex="0">
-      <div class="folder-container">
-        <div class="folder">
-          <div class="front-side">
-            <div class="tip"></div>
-            <div class="cover"></div>
-          </div>
-          <div class="back-side cover"></div>
-        </div>
-        <label class="custom-file-upload" for="file">
-          Choose a file
-        </label>
-      </div>
-      <p class="drop-primary" id="drop-primary-text">Drop your video or image here, or browse</p>
-      <p class="drop-secondary" id="drop-secondary-text">Supports MP4, MOV, WebM, MKV, PNG, JPG, WEBP • Max 4K resolution</p>
-    </div>
-    <input type="file" id="file" accept=".mp4,.mov,.m4v,.webm,.mkv,.avi,.flv,.png,.jpg,.jpeg,.webp">
-
-    <!-- Processing View -->
-    <div class="processing" id="processing">
-      <div class="processing-layout">
-        <!-- Lottie AI Scanner Stage -->
-        <div class="lottie-scan-stage" id="lottie-scan-stage">
-          <div class="scan-bg-preview" id="scan-bg-preview"></div>
-          <div class="scan-bg-overlay"></div>
-          <div class="scan-badge">
-            <svg viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
-            AI Frame Matrix Scanner
-          </div>
-          <div class="lottie-container" id="lottie-container"></div>
-          <div class="stage-title" id="stage-title">Analyzing and detecting...</div>
-          <p class="stage-sub" id="stage-sub">Reconstructing background and removing watermark cleanly</p>
-          <div class="scan-progress-box">
-            <div class="scan-progress-header">
-              <span id="scan-file-label">Restoration progress</span>
-              <span class="scan-pct-value" id="ring-pct">0%</span>
-            </div>
-            <div class="scan-progress-track">
-              <div class="scan-progress-bar" id="player-progress-fill"></div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Right Side: Details & Progress Chips -->
-        <div class="processing-details">
-          <div class="status-badge">
-            <span class="status-dot"></span>
-            PROCESSING
-          </div>
-          <h2 class="details-title" id="details-title">Restoring background with AI...</h2>
-          <p class="details-sub">Analyzing pixels and reconstructing original background. One moment.</p>
-
-          <div class="step-track">
-            <div class="step-chip-row" id="chip-queued">
-              <div class="chip-indicator">1</div>
-              <span>Upload to server</span>
-            </div>
-            <div class="step-chip-row" id="chip-scanning">
-              <div class="chip-indicator">2</div>
-              <span>Scan frames & detect watermark</span>
-            </div>
-            <div class="step-chip-row" id="chip-removing">
-              <div class="chip-indicator">3</div>
-              <span>Intelligent background reconstruction</span>
-            </div>
-            <div class="step-chip-row" id="chip-finalizing">
-              <div class="chip-indicator">4</div>
-              <span>Finalizing clean stream</span>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Result View -->
-    <div class="result" id="result">
-      <div class="result-icon-circle">
-        <svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
-      </div>
-      <h3>Watermark Removed — Clean & Seamless</h3>
-      <p>Smart AI reconstruction. Original texture and detail preserved.</p>
-
-      <!-- Interactive Mode Bar: Compare vs Box Eraser -->
-      <div class="result-mode-bar" id="result-mode-bar" style="display:none;">
-        <button type="button" class="mode-btn active" id="btn-mode-slider" onclick="setResultMode('slider')">
-          <svg viewBox="0 0 24 24"><path d="M8 7l-5 5 5 5M16 7l5 5-5 5"/><line x1="12" y1="3" x2="12" y2="21"/></svg>
-          Compare Slider
-        </button>
-        <button type="button" class="mode-btn" id="btn-mode-eraser" onclick="setResultMode('eraser')">
-          <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" stroke-dasharray="3 3"/><path d="M7 17l10-10"/></svg>
-          Select & Erase Watermark
-        </button>
-      </div>
-
-      <!-- Live Interactive Comparison Slider for User Upload -->
-      <div class="result-slider-container" id="user-split-wrap" style="display:none;">
-        <div class="split-slider-container" id="user-split-slider">
-          <div class="split-layer split-before">
-            <img src="" id="user-img-before" alt="Original" class="split-img">
-            <span class="split-label before-label">Original</span>
-          </div>
-          <div class="split-layer split-after" id="user-split-after">
-            <img src="" id="user-img-after" alt="Cleaned image" class="split-img">
-            <span class="split-label after-label" id="after-layer-label">Watermark Removed</span>
-          </div>
-          <div class="split-handle" id="user-split-handle">
-            <div class="split-line"></div>
-            <div class="split-knob">
-              <svg viewBox="0 0 24 24"><path d="M8 7l-5 5 5 5M16 7l5 5-5 5"/></svg>
-            </div>
-          </div>
-          <input type="range" min="0" max="100" value="50" class="split-range" id="user-range" aria-label="Compare Original and Cleaned">
-
-          <!-- Interactive Box Eraser Overlay -->
-          <div class="box-draw-overlay" id="box-draw-overlay" style="display:none;">
-            <div class="box-selection-rect" id="box-selection-rect" style="display:none;"></div>
-            <div class="box-floating-bar" id="box-floating-bar" style="display:none;" title="Drag anywhere to move bar">
-              <button type="button" class="btn-box-erase" id="btn-box-erase" onclick="submitBoxErase()">⚡ Erase with AI</button>
-              <button type="button" class="btn-box-cancel" onclick="cancelBoxSelection()" title="Cancel">✕</button>
-            </div>
-            <div class="box-hint-badge" id="box-hint-badge">Drag mouse over watermark to select & erase</div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Removix AI Provenance Audit Badge -->
-      <div class="audit-card">
-        <div class="audit-header">
-          <div class="audit-badge-pill">
-            <svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-            <span>Removix Deep Clean Audit</span>
-          </div>
-          <span class="audit-status-tag">✓ 100% Seamlessly Restored</span>
-        </div>
-        <div class="audit-grid">
-          <div class="audit-item">
-            <div class="audit-check">✓</div>
-            <div>
-              <strong>Visible AI Watermark</strong>
-              <small>Seamless AI reconstruction</small>
-            </div>
-          </div>
-          <div class="audit-item">
-            <div class="audit-check">✓</div>
-            <div>
-              <strong>Zero Smudge Guarantee</strong>
-              <small>Original texture & grain preserved</small>
-            </div>
-          </div>
-          <div class="audit-item">
-            <div class="audit-check">✓</div>
-            <div>
-              <strong>AI Provenance & Metadata</strong>
-              <small>Generative markers removed</small>
-            </div>
-          </div>
-          <div class="audit-item">
-            <div class="audit-check">✓</div>
-            <div>
-              <strong>Lossless Dimensions</strong>
-              <small>Byte-identical pixels outside watermark</small>
-            </div>
-          </div>
-        </div>
-      </div>
-      <div class="result-actions">
-        <!-- From Uiverse.io by nazar-gavrylyk --> 
-        <div class="container">
-          <label class="label" id="dl-label">
-            <input type="checkbox" class="input" id="dl-checkbox" />
-            <span class="circle">
-              <svg
-                class="icon"
-                aria-hidden="true"
-                xmlns="http://www.w3.org/2000/svg"
-                fill="none"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  stroke="currentColor"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  stroke-width="1.5"
-                  d="M12 19V5m0 14-4-4m4 4 4-4"
-                ></path>
-              </svg>
-              <div class="square"></div>
-            </span>
-            <p class="title">Download</p>
-            <p class="title">Open</p>
-          </label>
-        </div>
-        <button class="btn-reset" id="reset-btn">
-          <svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
-          Clean Another File
-        </button>
-      </div>
-    </div>
-
-    <!-- Error Box -->
-    <div class="error-box" id="error-box"></div>
-
-  </div>
-</section>
-
-<!-- Feature Cards Section (Image 4) -->
-<section class="section-features">
-  <div class="features-grid">
-    <!-- Card 1 -->
-    <div class="feature-box">
-      <div class="feature-top">
-        <div class="feature-icon-pill">
-          <svg viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="2" y1="17" x2="7" y2="17"/><line x1="17" y1="17" x2="22" y2="17"/><line x1="17" y1="7" x2="22" y2="7"/></svg>
-        </div>
-        <span class="free-badge">FREE</span>
-      </div>
-      <h3>Visible logo, lifted</h3>
-      <p>The AI watermark sparkle is tracked and removed frame-to-frame without annoying blurs or corner crops.</p>
-    </div>
-
-    <!-- Card 2 -->
-    <div class="feature-box">
-      <div class="feature-top">
-        <div class="feature-icon-pill">
-          <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
-        </div>
-        <span class="free-badge">FREE</span>
-      </div>
-      <h3>Every frame, clean</h3>
-      <p>The logo is removed across the whole clip, no flicker, no smear. Frame coherence is preserved 100%.</p>
-    </div>
-
-    <!-- Card 3 -->
-    <div class="feature-box">
-      <div class="feature-top">
-        <div class="feature-icon-pill">
-          <svg viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-        </div>
-        <span class="free-badge">FREE</span>
-      </div>
-      <h3>Pixel-perfect quality</h3>
-      <p>Resolution, frame rate, and bitrate stay exactly as rendered. Audio stream passes untouched.</p>
-    </div>
-  </div>
-
-  <p class="features-footer-caption">
-    No re-encode penalty, resolution, frame rate, and bitrate stay exactly as originally rendered.
-  </p>
-</section>
-
-<!-- Before & After Comparison Section (Image 5) -->
-<section class="section-comparison">
-  <div class="comparison-grid">
-    <div class="comp-text-col">
-      <span class="comp-label">Removix Image & Video Engine</span>
-      <h2 class="comp-title">How to remove the watermark from an image</h2>
-      <p class="comp-desc">
-        Switch to the Image tab, drop in any Gemini, Imagen or AI picture, and the <strong>Removix image watermark remover</strong> lifts the sparkle logo automatically at the original resolution. Intelligent background reconstruction restores the watermark area with seamless precision. Outside the watermark zone, every pixel is byte-identical to the original. No compression. No artifacts. No quality loss.
-      </p>
-
-      <div class="comp-stats">
-        <div class="comp-stat-item">
-          <h4>byte-identical</h4>
-          <p>Outside watermark</p>
-        </div>
-        <div class="comp-stat-item">
-          <h4>unchanged</h4>
-          <p>Dimensions</p>
-        </div>
-        <div class="comp-stat-item">
-          <h4>none</h4>
-          <p>Re-compression</p>
-        </div>
-      </div>
-    </div>
-
-    <!-- Interactive Split Curtain Comparison Slider -->
-    <div class="comp-visuals-wrapper">
-      <div class="split-slider-container" id="homepage-split-slider">
-        <div class="split-layer split-before">
-          <img src="/static/before.webp?v=8" onerror="if(this.src.indexOf('/before.webp')===-1)this.src='/before.webp'" width="1684" height="2528" alt="Original" class="split-img" loading="eager">
-          <span class="split-label before-label">Original</span>
-        </div>
-        <div class="split-layer split-after" id="homepage-split-after">
-          <img src="/static/after.webp?v=8" onerror="if(this.src.indexOf('/after.webp')===-1)this.src='/after.webp'" width="1684" height="2528" alt="Watermark Removed" class="split-img" loading="eager">
-          <span class="split-label after-label">Watermark Removed</span>
-        </div>
-        <div class="split-handle" id="homepage-split-handle">
-          <div class="split-line"></div>
-          <div class="split-knob">
-            <svg viewBox="0 0 24 24"><path d="M8 7l-5 5 5 5M16 7l5 5-5 5"/></svg>
-          </div>
-        </div>
-        <input type="range" min="0" max="100" value="50" class="split-range" id="homepage-range" aria-label="Compare Before and After">
-      </div>
-    </div>
-  </div>
-</section>
-
-<!-- "Your images never leave your device" Privacy Section (Image 2) -->
-<section class="section-privacy">
-  <h2 class="privacy-title">Your images never leave your device</h2>
-
-  <div class="privacy-grid">
-    <!-- Card 1 -->
-    <div class="privacy-card">
-      <div class="privacy-icon-box">
-        <svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-      </div>
-      <h3>Local processing</h3>
-      <p>Everything runs directly on your machine. Your images are never uploaded to external servers. We never see them. We never store them.</p>
-    </div>
-
-    <!-- Card 2 -->
-    <div class="privacy-card">
-      <div class="privacy-icon-box">
-        <svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
-      </div>
-      <h3>Personal & commercial use</h3>
-      <p>Use the cleaned images for client work, social posts, marketing campaigns, presentations, anything you'd use a regular photo for.</p>
-    </div>
-
-    <!-- Card 3 -->
-    <div class="privacy-card">
-      <div class="privacy-icon-box">
-        <svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-      </div>
-      <h3>Regulated industries</h3>
-      <p>Healthcare, legal, and finance: your images stay on your device. No data leakage. No compliance risk. No third-party transmission.</p>
-    </div>
-  </div>
-</section>
-
-<!-- Professional Developer Footer -->
-<footer class="site-footer">
-  <p class="copyright-text">
-    Copyright &copy; 2026 Removix • Developed by
-    <a href="https://shivankthakur.com/" target="_blank" rel="noopener noreferrer" class="dev-link">
-      Shivank Thakur
-      <svg viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
-    </a>
-  </p>
-</footer>
-
-<script>
-const dropzone = document.getElementById('dropzone');
-const fileInput = document.getElementById('file');
-const processingEl = document.getElementById('processing');
-const resultEl = document.getElementById('result');
-const errorBox = document.getElementById('error-box');
-const ringPct = document.getElementById('ring-pct');
-const stageTitle = document.getElementById('stage-title');
-const stageSub = document.getElementById('stage-sub');
-const playerProgressFill = document.getElementById('player-progress-fill');
-const scanFileLabel = document.getElementById('scan-file-label');
-const dlCheckbox = document.getElementById('dl-checkbox');
-const dlLabel = document.getElementById('dl-label');
-const resetBtn = document.getElementById('reset-btn');
-
-let currentMode = 'video';
-let currentZone = 'auto';
-let currentResultMode = 'slider';
-let currentJobId = '';
-let currentJobFilename = '';
-let isDrawingBox = false;
-let boxStartX = 0, boxStartY = 0;
-let activeBox = null;
-let pollTimer = null;
-let lottieAnim = null;
-let currentDownloadUrl = '';
-let currentDownloadFilename = '';
-let isDownloadComplete = false;
-
-function setZone(zone) {
-  currentZone = zone;
-  document.querySelectorAll('.zone-pill').forEach(p => p.classList.remove('active'));
-  const idMap = { 'auto': 'pill-auto', 'bottom-right': 'pill-br', 'bottom-left': 'pill-bl' };
-  const btn = document.getElementById(idMap[zone]);
-  if (btn) btn.classList.add('active');
-}
-
-function showToast(msg) {
-  // Toast notifications disabled per user request
-}
-
-function triggerDownload() {
-  if (!currentJobId) return;
-
-  const isDesktop = !!(window.pywebview || window.__removix_desktop);
-
-  fetch('/api/save_to_downloads/' + currentJobId, { method: 'POST' })
-    .then(r => r.json())
-    .then(data => {
-      if (data && data.status === 'ok') {
-        if (!isDesktop) {
-          fallbackBrowserDownload();
-        }
-      } else {
-        fallbackBrowserDownload();
-      }
-    })
-    .catch(() => {
-      fallbackBrowserDownload();
-    });
-}
-
-function fallbackBrowserDownload() {
-  if (!currentDownloadUrl) return;
-  const a = document.createElement('a');
-  a.href = currentDownloadUrl;
-  a.download = currentDownloadFilename || 'removix_clean_file';
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-}
-
-if (dlCheckbox) {
-  dlCheckbox.addEventListener('change', () => {
-    if (dlCheckbox.checked) {
-      if (dlLabel) dlLabel.classList.add('is-checked');
-      triggerDownload();
-      setTimeout(() => {
-        isDownloadComplete = true;
-      }, 2350);
-    }
-  });
-
-  dlCheckbox.addEventListener('click', (e) => {
-    if (isDownloadComplete) {
-      e.preventDefault();
-      triggerDownload();
-    }
-  });
-}
-
-function initLottie() {
-  if (lottieAnim) return;
-  const container = document.getElementById('lottie-container');
-  if (!container || !window.lottie) return;
-  try {
-    lottieAnim = window.lottie.loadAnimation({
-      container: container,
-      renderer: 'svg',
-      loop: true,
-      autoplay: true,
-      path: '/api/animation.json'
-    });
-  } catch (e) {
-    console.warn('Lottie failed to load', e);
-  }
-}
-
-// Preload Lottie animation on DOM ready
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', initLottie);
-} else {
-  initLottie();
-}
-
-const STAGES = {
-  queued:     { title: 'Uploading file...',            sub: 'Preparing media and initializing AI restoration engine.' },
-  scanning:   { title: 'Analyzing and detecting...',   sub: 'Detecting watermark coordinates with intelligent precision.' },
-  removing:   { title: 'Reconstructing with AI...',    sub: 'Intelligent background reconstruction in progress.' },
-  finalizing: { title: 'Finalizing clean output...',   sub: 'Saving the clean, restored file with zero quality loss.' },
-};
-const stageOrder = ['queued', 'scanning', 'removing', 'finalizing', 'done'];
-
-function setMode(mode) {
-  currentMode = mode;
-  document.getElementById('tab-video').classList.toggle('active', mode === 'video');
-  document.getElementById('tab-image').classList.toggle('active', mode === 'image');
-  if (mode === 'video') {
-    fileInput.accept = ".mp4,.mov,.m4v,.webm,.mkv,.avi,.flv";
-    document.getElementById('drop-primary-text').textContent = "Drop your video here, or browse";
-    document.getElementById('drop-secondary-text').textContent = "Supports MP4, MOV, WebM, MKV • Up to 4K resolution";
-  } else {
-    fileInput.accept = ".png,.jpg,.jpeg,.webp";
-    document.getElementById('drop-primary-text').textContent = "Drop your image here, or browse";
-    document.getElementById('drop-secondary-text').textContent = "Supports PNG, JPG, JPEG, WEBP • Lossless quality";
-  }
-}
-
-['dragenter','dragover'].forEach(evt =>
-  dropzone.addEventListener(evt, e => { e.preventDefault(); dropzone.classList.add('hover'); }));
-['dragleave','drop'].forEach(evt =>
-  dropzone.addEventListener(evt, e => { e.preventDefault(); dropzone.classList.remove('hover'); }));
-dropzone.addEventListener('drop', e => { const f = e.dataTransfer.files[0]; if (f) startJob(f); });
-dropzone.addEventListener('click', e => {
-  if (e.target !== fileInput && !e.target.closest('label[for="file"]')) {
-    fileInput.click();
-  }
-});
-dropzone.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') fileInput.click(); });
-fileInput.addEventListener('change', e => { if (e.target.files[0]) startJob(e.target.files[0]); });
-resetBtn.addEventListener('click', resetUI);
-
-let maxProgressSeen = 0;
-function setProgress(percent, msg) {
-  let p = Math.max(0, Math.min(100, (percent !== null && percent !== undefined) ? percent : 0));
-  if (p < maxProgressSeen && p > 0 && maxProgressSeen < 100) {
-    p = maxProgressSeen;
-  } else {
-    maxProgressSeen = p;
-  }
-  if (ringPct) ringPct.textContent = Math.round(p) + '%';
-  if (playerProgressFill) playerProgressFill.style.width = p + '%';
-  if (msg && stageSub) {
-    stageSub.textContent = msg;
-    stageSub.setAttribute('data-custom', '1');
-  } else if (!msg && stageSub) {
-    stageSub.removeAttribute('data-custom');
-  }
-}
-
-function resetUI() {
-  maxProgressSeen = 0;
-  cleanupStream();
-  processingEl.classList.remove('active');
-  resultEl.classList.remove('active');
-  errorBox.classList.remove('active');
-  dropzone.style.display = '';
-  document.getElementById('tool-tabs').style.display = 'flex';
-  const zoneBar = document.getElementById('zone-pills-bar');
-  if (zoneBar) zoneBar.style.display = 'flex';
-  setZone('auto');
-  const bgPreview = document.getElementById('scan-bg-preview');
-  if (bgPreview) {
-    bgPreview.style.backgroundImage = '';
-    bgPreview.classList.remove('has-image');
-  }
-  if (ringPct) ringPct.textContent = '0%';
-  if (playerProgressFill) playerProgressFill.style.width = '0%';
-  if (stageSub) stageSub.removeAttribute('data-custom');
-  document.querySelectorAll('.step-chip-row').forEach(c => c.classList.remove('active','done'));
-  if (lottieAnim) {
-    lottieAnim.pause();
-  }
-  if (dlCheckbox) dlCheckbox.checked = false;
-  if (dlLabel) dlLabel.classList.remove('is-checked');
-  isDownloadComplete = false;
-  currentDownloadUrl = '';
-  currentDownloadFilename = '';
-  fileInput.value = '';
-  const userWrap = document.getElementById('user-split-wrap');
-  if (userWrap) userWrap.style.display = 'none';
-  const modeBar = document.getElementById('result-mode-bar');
-  if (modeBar) modeBar.style.display = 'none';
-  cancelBoxSelection();
-  setResultMode('slider');
-  currentJobId = '';
-  const beforeImg = document.getElementById('user-img-before');
-  const afterImg = document.getElementById('user-img-after');
-  if (beforeImg) beforeImg.src = '';
-  if (afterImg) afterImg.src = '';
-}
-
-function setResultMode(mode) {
-  currentResultMode = mode;
-  const btnSlider = document.getElementById('btn-mode-slider');
-  const btnEraser = document.getElementById('btn-mode-eraser');
-  const overlay = document.getElementById('box-draw-overlay');
-  const userRange = document.getElementById('user-range');
-  const userHandle = document.getElementById('user-split-handle');
-  const beforeLayer = document.querySelector('#user-split-slider .split-before');
-  const afterLayer = document.querySelector('#user-split-slider .split-after');
-  const afterLabel = document.getElementById('after-layer-label');
-
-  if (mode === 'slider') {
-    if (btnSlider) btnSlider.classList.add('active');
-    if (btnEraser) btnEraser.classList.remove('active');
-    if (overlay) overlay.style.display = 'none';
-    if (userRange) userRange.style.display = 'block';
-    if (userHandle) userHandle.style.display = 'flex';
-    if (afterLabel) afterLabel.textContent = 'Watermark Removed';
-    cancelBoxSelection();
-    const val = userRange ? userRange.value : 50;
-    if (beforeLayer) beforeLayer.style.clipPath = `polygon(0 0, ${val}% 0, ${val}% 100%, 0 100%)`;
-    if (afterLayer) afterLayer.style.clipPath = `polygon(${val}% 0, 100% 0, 100% 100%, ${val}% 100%)`;
-    if (userHandle) userHandle.style.left = val + '%';
-  } else {
-    if (btnEraser) btnEraser.classList.add('active');
-    if (btnSlider) btnSlider.classList.remove('active');
-    if (userRange) userRange.style.display = 'none';
-    if (userHandle) userHandle.style.display = 'none';
-    if (beforeLayer) beforeLayer.style.clipPath = 'polygon(0 0, 0 0, 0 100%, 0 100%)';
-    if (afterLayer) afterLayer.style.clipPath = 'polygon(0 0, 100% 0, 100% 100%, 0 100%)';
-    if (afterLabel) afterLabel.textContent = 'Select Area to Erase';
-    if (overlay) overlay.style.display = 'block';
-    cancelBoxSelection();
-  }
-}
-
-function cancelBoxSelection() {
-  activeBox = null;
-  const rectEl = document.getElementById('box-selection-rect');
-  const floatBar = document.getElementById('box-floating-bar');
-  if (rectEl) {
-    rectEl.style.display = 'none';
-    rectEl.style.transition = 'none';
-  }
-  if (floatBar) floatBar.style.display = 'none';
-}
-
-function positionFloatBar() {
-  const overlay = document.getElementById('box-draw-overlay');
-  const floatBar = document.getElementById('box-floating-bar');
-  if (!overlay || !floatBar || !activeBox) return;
-
-  floatBar.style.display = 'flex';
-  const barWidth = floatBar.offsetWidth || 140;
-  const barHeight = floatBar.offsetHeight || 32;
-  const pad = 8;
-  const ovW = overlay.clientWidth;
-  const ovH = overlay.clientHeight;
-
-  // Decide whether to place above or below the box
-  let barTop;
-  const spaceBelow = ovH - (activeBox.y + activeBox.h);
-  const spaceAbove = activeBox.y;
-
-  if (spaceBelow < barHeight + pad + 6 && spaceAbove >= barHeight + pad) {
-    // Not enough room below -> Place ABOVE the box
-    barTop = activeBox.y - barHeight - 8;
-  } else if (spaceBelow >= barHeight + pad + 6) {
-    // Plenty of room below -> Place BELOW the box
-    barTop = activeBox.y + activeBox.h + 8;
-  } else {
-    // Box covers most of vertical space, clamp inside
-    barTop = Math.max(pad, Math.min(ovH - barHeight - pad, activeBox.y + activeBox.h - barHeight - 8));
-  }
-
-  // Strictly clamp inside overlay vertical boundaries
-  barTop = Math.max(pad, Math.min(ovH - barHeight - pad, barTop));
-
-  // Horizontal position:
-  // Align with activeBox.x, but ensure it NEVER overflows right or left
-  let barLeft = activeBox.x;
-  if (barLeft + barWidth > ovW - pad) {
-    barLeft = ovW - barWidth - pad;
-  }
-  barLeft = Math.max(pad, barLeft);
-
-  floatBar.style.top = Math.round(barTop) + 'px';
-  floatBar.style.left = Math.round(barLeft) + 'px';
-}
-
-let isDraggingBar = false;
-let barDragStartX = 0, barDragStartY = 0;
-let barInitialLeft = 0, barInitialTop = 0;
-
-function initFloatBarDraggable() {
-  const floatBar = document.getElementById('box-floating-bar');
-  const overlay = document.getElementById('box-draw-overlay');
-  if (!floatBar || !overlay || floatBar._hasDragInit) return;
-  floatBar._hasDragInit = true;
-
-  floatBar.addEventListener('pointerdown', (e) => {
-    if (e.target.closest('button')) return;
-    isDraggingBar = true;
-    barDragStartX = e.clientX;
-    barDragStartY = e.clientY;
-    barInitialLeft = parseFloat(floatBar.style.left) || 0;
-    barInitialTop = parseFloat(floatBar.style.top) || 0;
-    try { floatBar.setPointerCapture(e.pointerId); } catch(err) {}
-    e.stopPropagation();
-  });
-
-  floatBar.addEventListener('pointermove', (e) => {
-    if (!isDraggingBar) return;
-    const dx = e.clientX - barDragStartX;
-    const dy = e.clientY - barDragStartY;
-    const maxLeft = Math.max(6, overlay.clientWidth - floatBar.offsetWidth - 6);
-    const maxTop = Math.max(6, overlay.clientHeight - floatBar.offsetHeight - 6);
-    const newLeft = Math.max(6, Math.min(maxLeft, barInitialLeft + dx));
-    const newTop = Math.max(6, Math.min(maxTop, barInitialTop + dy));
-    floatBar.style.left = Math.round(newLeft) + 'px';
-    floatBar.style.top = Math.round(newTop) + 'px';
-    e.stopPropagation();
-  });
-
-  const stopBarDrag = (e) => {
-    if (isDraggingBar) {
-      isDraggingBar = false;
-      try { floatBar.releasePointerCapture(e.pointerId); } catch(err) {}
-      e.stopPropagation();
-    }
-  };
-
-  floatBar.addEventListener('pointerup', stopBarDrag);
-  floatBar.addEventListener('pointercancel', stopBarDrag);
-}
-
-function initBoxEraserEvents() {
-  const overlay = document.getElementById('box-draw-overlay');
-  const rectEl = document.getElementById('box-selection-rect');
-  const floatBar = document.getElementById('box-floating-bar');
-  if (!overlay || !rectEl || !floatBar) return;
-
-  initFloatBarDraggable();
-
-  const onDown = (e) => {
-    if (e.target.closest('#box-floating-bar')) return;
-    const r = overlay.getBoundingClientRect();
-    boxStartX = e.clientX - r.left;
-    boxStartY = e.clientY - r.top;
-    isDrawingBox = true;
-    activeBox = null;
-    floatBar.style.display = 'none';
-    rectEl.style.display = 'block';
-    rectEl.style.transition = 'none';
-    rectEl.style.left = boxStartX + 'px';
-    rectEl.style.top = boxStartY + 'px';
-    rectEl.style.width = '0px';
-    rectEl.style.height = '0px';
-    try { overlay.setPointerCapture(e.pointerId); } catch(err) {}
-  };
-
-  const onMove = (e) => {
-    if (!isDrawingBox) return;
-    const r = overlay.getBoundingClientRect();
-    const curX = Math.max(0, Math.min(r.width, e.clientX - r.left));
-    const curY = Math.max(0, Math.min(r.height, e.clientY - r.top));
-    const x = Math.min(boxStartX, curX);
-    const y = Math.min(boxStartY, curY);
-    const w = Math.abs(curX - boxStartX);
-    const h = Math.abs(curY - boxStartY);
-    rectEl.style.left = x + 'px';
-    rectEl.style.top = y + 'px';
-    rectEl.style.width = w + 'px';
-    rectEl.style.height = h + 'px';
-    activeBox = { x, y, w, h };
-  };
-
-  const onUp = (e) => {
-    if (!isDrawingBox) return;
-    isDrawingBox = false;
-    try { overlay.releasePointerCapture(e.pointerId); } catch(err) {}
-    if (!activeBox || activeBox.w < 6 || activeBox.h < 6) {
-      cancelBoxSelection();
-      return;
-    }
-    positionFloatBar();
-  };
-
-  overlay.addEventListener('pointerdown', onDown);
-  overlay.addEventListener('pointermove', onMove);
-  overlay.addEventListener('pointerup', onUp);
-  overlay.addEventListener('pointercancel', () => { isDrawingBox = false; cancelBoxSelection(); });
-  window.addEventListener('resize', () => { if (activeBox) positionFloatBar(); });
-}
-
-function submitBoxErase() {
-  if (!activeBox || !currentJobId) return;
-  const afterImg = document.getElementById('user-img-after');
-  const overlay = document.getElementById('box-draw-overlay');
-  if (!afterImg || !overlay) return;
-
-  const r = overlay.getBoundingClientRect();
-  if (r.width <= 0 || r.height <= 0) return;
-  const naturalW = afterImg.naturalWidth || r.width;
-  const naturalH = afterImg.naturalHeight || r.height;
-  const scaleX = naturalW / r.width;
-  const scaleY = naturalH / r.height;
-  const imgX = Math.max(0, Math.round(activeBox.x * scaleX));
-  const imgY = Math.max(0, Math.round(activeBox.y * scaleY));
-  const imgW = Math.min(naturalW - imgX, Math.round(activeBox.w * scaleX));
-  const imgH = Math.min(naturalH - imgY, Math.round(activeBox.h * scaleY));
-
-  if (imgW < 4 || imgH < 4) {
-    alert('Selected area is too small. Please drag a box over the watermark.');
-    return;
-  }
-
-  const eraseBtn = document.getElementById('btn-box-erase');
-  if (eraseBtn) {
-    eraseBtn.disabled = true;
-    eraseBtn.textContent = 'Erasing with AI...';
-  }
-
-  fetch('/api/reclean/' + currentJobId, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ box: [imgX, imgY, imgW, imgH] })
-  })
-  .then(res => res.json())
-  .then(data => {
-    if (eraseBtn) {
-      eraseBtn.disabled = false;
-      eraseBtn.textContent = '⚡ Erase with AI';
-    }
-    if (data.output_url) {
-      const bustUrl = data.output_url + (data.output_url.indexOf('?') === -1 ? '?' : '&') + '_t=' + Date.now();
-      const freshImg = new Image();
-      freshImg.onload = () => {
-        afterImg.src = bustUrl;
-        setupSplitSlider('user-split-slider');
-        cancelBoxSelection();
-        setResultMode('slider');
-      };
-      freshImg.onerror = () => {
-        afterImg.src = bustUrl;
-        cancelBoxSelection();
-        setResultMode('slider');
-      };
-      freshImg.src = bustUrl;
-    } else if (data.job_id) {
-      cancelBoxSelection();
-      setResultMode('slider');
-      resultEl.classList.remove('active');
-      processingEl.classList.add('active');
-      setStage('scanning');
-      setProgress(5, 'Re-restoring video with selected area...');
-      poll(data.job_id, currentJobFilename || 'video');
-    } else if (data.error) {
-      alert('Could not erase: ' + data.error);
-    }
-  })
-  .catch(err => {
-    if (eraseBtn) {
-      eraseBtn.disabled = false;
-      eraseBtn.textContent = '⚡ Erase with AI';
-    }
-    console.error('Erase error:', err);
-    alert('Could not erase selected area. Please try again.');
-  });
-}
-
-function setupSplitSlider(sliderContainerId) {
-  const container = document.getElementById(sliderContainerId);
-  if (!container) return;
-  const range = container.querySelector('.split-range');
-  const beforeLayer = container.querySelector('.split-before');
-  const afterLayer = container.querySelector('.split-after');
-  const handle = container.querySelector('.split-handle');
-  if (!range || !afterLayer || !handle) return;
-
-  function update() {
-    if (sliderContainerId === 'user-split-slider' && currentResultMode !== 'slider') return;
-    const val = parseFloat(range.value);
-    if (beforeLayer) {
-      beforeLayer.style.clipPath = `polygon(0 0, ${val}% 0, ${val}% 100%, 0 100%)`;
-    }
-    afterLayer.style.clipPath = `polygon(${val}% 0, 100% 0, 100% 100%, ${val}% 100%)`;
-    handle.style.left = val + '%';
-  }
-
-  // Adjust container aspect ratio to match natural image dimensions for user-uploaded images
-  if (sliderContainerId !== 'homepage-split-slider') {
-    const img = container.querySelector('.split-before img');
-    if (img) {
-      const adjust = () => {
-        if (img.naturalWidth && img.naturalHeight) {
-          container.style.aspectRatio = `${img.naturalWidth} / ${img.naturalHeight}`;
-        }
-        update();
-      };
-      if (img.complete && img.naturalWidth) {
-        adjust();
-      } else {
-        img.addEventListener('load', adjust, { once: true });
-      }
-    }
-  }
-
-  function setPosFromClientX(clientX) {
-    const rect = container.getBoundingClientRect();
-    if (!rect.width) return;
-    let pct = ((clientX - rect.left) / rect.width) * 100;
-    pct = Math.max(0, Math.min(100, pct));
-    range.value = pct;
-    update();
-  }
-
-  if (!container._hasSliderEvents) {
-    container._hasSliderEvents = true;
-
-    let isDragging = false;
-
-    container.addEventListener('pointerdown', (e) => {
-      if (sliderContainerId === 'user-split-slider' && currentResultMode !== 'slider') return;
-      isDragging = true;
-      try { container.setPointerCapture(e.pointerId); } catch(err) {}
-      setPosFromClientX(e.clientX);
-    });
-
-    container.addEventListener('pointermove', (e) => {
-      if (!isDragging) return;
-      setPosFromClientX(e.clientX);
-    });
-
-    const stopDragging = (e) => {
-      if (isDragging) {
-        isDragging = false;
-        try { container.releasePointerCapture(e.pointerId); } catch(err) {}
-      }
-    };
-
-    container.addEventListener('pointerup', stopDragging);
-    container.addEventListener('pointercancel', stopDragging);
-
-    range.addEventListener('input', update);
-    range.addEventListener('change', update);
-  }
-
-  update();
-}
-
-function setStage(stage) {
-  const idx = stageOrder.indexOf(stage);
-  ['queued','scanning','removing','finalizing'].forEach((key, keyIdx) => {
-    const chip = document.getElementById('chip-' + key);
-    if (chip) {
-      chip.classList.toggle('done', keyIdx < idx);
-      chip.classList.toggle('active', keyIdx === idx);
-    }
-  });
-  const info = STAGES[stage];
-  if (info) {
-    stageTitle.textContent = info.title;
-    if (!stageSub.getAttribute('data-custom')) {
-      stageSub.textContent = info.sub;
-    }
-  }
-}
-
-function startJob(file) {
-  dropzone.style.display = 'none';
-  document.getElementById('tool-tabs').style.display = 'none';
-  const zoneBar = document.getElementById('zone-pills-bar');
-  if (zoneBar) zoneBar.style.display = 'none';
-  processingEl.classList.add('active');
-  errorBox.classList.remove('active');
-  resultEl.classList.remove('active');
-  setStage('queued');
-  setProgress(0);
-
-  if (scanFileLabel) {
-    const fn = file.name || 'File';
-    scanFileLabel.textContent = fn.length > 24 ? fn.slice(0, 22) + '...' : fn;
-  }
-
-  const bgPreview = document.getElementById('scan-bg-preview');
-  if (bgPreview && file) {
-    if (file.type && file.type.startsWith('image/')) {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        bgPreview.style.backgroundImage = `url(${e.target.result})`;
-        bgPreview.classList.add('has-image');
-      };
-      reader.readAsDataURL(file);
-    } else if (file.type && file.type.startsWith('video/')) {
-      const v = document.createElement('video');
-      v.preload = 'metadata';
-      v.muted = true;
-      v.playsInline = true;
-      const vUrl = URL.createObjectURL(file);
-      v.src = vUrl;
-      v.onloadeddata = () => {
-        v.currentTime = 0.1;
-      };
-      v.onseeked = () => {
-        try {
-          const c = document.createElement('canvas');
-          c.width = v.videoWidth || 320;
-          c.height = v.videoHeight || 240;
-          const ctx = c.getContext('2d');
-          ctx.drawImage(v, 0, 0, c.width, c.height);
-          bgPreview.style.backgroundImage = `url(${c.toDataURL()})`;
-          bgPreview.classList.add('has-image');
-        } catch (err) {}
-        URL.revokeObjectURL(vUrl);
-      };
-    }
-  }
-
-  initLottie();
-  if (lottieAnim) {
-    lottieAnim.play();
-  }
-
-  const fd = new FormData();
-  fd.append('file', file);
-  fd.append('corner', currentZone);
-
-  fetch('/api/upload', { method: 'POST', body: fd })
-    .then(r => r.json().then(j => ({ ok: r.ok, body: j })))
-    .then(({ ok, body }) => {
-      if (!ok) throw new Error(body.error || 'Upload failed.');
-      poll(body.job_id, file.name);
-    })
-    .catch(err => showError(err.message));
-}
-
-let streamSource = null;
-
-function cleanupStream() {
-  if (pollTimer) {
-    clearInterval(pollTimer);
-    pollTimer = null;
-  }
-  if (streamSource) {
-    streamSource.close();
-    streamSource = null;
-  }
-}
-
-function handleJob(job, jobId, filename) {
-  if (!job) return;
-  if (job.stage) {
-    setStage(job.stage);
-  }
-  if (job.percent !== null && job.percent !== undefined) {
-    setProgress(job.percent, job.message);
-  }
-  if (job.stage === 'error') {
-    cleanupStream();
-    showError(job.error || 'Processing failed.');
-    return;
-  }
-  if (job.stage === 'done') {
-    cleanupStream();
-    setProgress(100);
-    setTimeout(() => {
-      processingEl.classList.remove('active');
-      resultEl.classList.add('active');
-      currentDownloadUrl = '/api/download/' + jobId;
-      currentDownloadFilename = 'removix_' + filename;
-      currentJobId = jobId;
-      currentJobFilename = filename;
-      if (dlCheckbox) dlCheckbox.checked = false;
-      if (dlLabel) dlLabel.classList.remove('is-checked');
-      isDownloadComplete = false;
-
-      // Live interactive split comparison for user upload
-      const userWrap = document.getElementById('user-split-wrap');
-      const modeBar = document.getElementById('result-mode-bar');
-      const inUrl = job.input_url || ('/api/preview/' + jobId + '/input');
-      const outUrl = job.output_url || ('/api/preview/' + jobId + '/output');
-      if (userWrap) {
-        const beforeImg = document.getElementById('user-img-before');
-        const afterImg = document.getElementById('user-img-after');
-        if (beforeImg && afterImg) {
-          const cacheBust = '?t=' + Date.now();
-          beforeImg.src = inUrl + cacheBust;
-          afterImg.src = outUrl + cacheBust;
-          afterImg.onerror = () => {
-            setTimeout(() => { afterImg.src = outUrl + '?retry=1&t=' + Date.now(); }, 600);
-          };
-          const userRange = document.getElementById('user-range');
-          if (userRange) userRange.value = 50;
-          userWrap.style.display = 'block';
-          if (modeBar) modeBar.style.display = 'flex';
-          setResultMode('slider');
-          setupSplitSlider('user-split-slider');
-        }
-      } else {
-        if (userWrap) userWrap.style.display = 'none';
-        if (modeBar) modeBar.style.display = 'none';
-      }
-    }, 450);
-  }
-}
-
-function startPolling(jobId, filename) {
-  if (pollTimer) clearInterval(pollTimer);
-  const checkStatus = () => {
-    fetch('/api/status/' + jobId)
-      .then(r => r.json())
-      .then(job => handleJob(job, jobId, filename))
-      .catch(() => {});
-  };
-  checkStatus();
-  pollTimer = setInterval(checkStatus, 200);
-}
-
-function poll(jobId, filename) {
-  cleanupStream();
-  startPolling(jobId, filename);
-}
-
-function showError(msg) {
-  cleanupStream();
-  processingEl.classList.remove('active');
-  errorBox.textContent = msg;
-  errorBox.classList.add('active');
-  dropzone.style.display = '';
-  document.getElementById('tool-tabs').style.display = 'flex';
-}
-
-function initApp() {
-  initLottie();
-  initBoxEraserEvents();
-  setupSplitSlider('homepage-split-slider');
-}
-
-initApp();
-document.addEventListener('DOMContentLoaded', initApp);
-</script>
-</body>
-</html>
-"""
+# =====================================================================
+# 5. ACTIVITY TRACKER & SETTINGS API ENDPOINTS
+# =====================================================================
+
+SETTINGS_FILE = Path(__file__).resolve().parent / "data" / "settings.json"
+
+
+@app.route("/api/activity/recent", methods=["GET"])
+def api_activity_recent():
+    """Returns the most recent processed file records."""
+    limit = request.args.get("limit", 10, type=int)
+    files = activity_tracker.get_recent_files(limit=limit)
+    return jsonify(files)
+
+
+@app.route("/api/activity/stats", methods=["GET"])
+def api_activity_stats():
+    """Returns activity statistics for the requested period (week, month, all)."""
+    period = request.args.get("period", "month").strip().lower()
+    if period not in ("week", "month", "all"):
+        period = "month"
+    stats = activity_tracker.get_stats(period=period)
+    return jsonify(stats)
+
+
+@app.route("/api/activity/delete/<int:file_id>", methods=["DELETE", "POST"])
+def api_activity_delete(file_id: int):
+    """Removes a file record from the activity history."""
+    success = activity_tracker.delete_file_record(file_id)
+    return jsonify({"success": success})
+
+
+@app.route("/api/activity/download/<int:file_id>", methods=["GET"])
+def api_activity_download(file_id: int):
+    """Downloads a file by its activity log ID if it exists on disk."""
+    record = activity_tracker.get_file_record(file_id)
+    if record and record.get("download_path"):
+        p = Path(record["download_path"])
+        if p.exists() and p.is_file():
+            return send_file(
+                str(p),
+                as_attachment=True,
+                download_name=record.get("name", p.name),
+            )
+    return redirect("/#recent-files")
+
+
+@app.route("/api/settings", methods=["GET", "POST"])
+def api_settings():
+    """Reads or updates application preferences (e.g. theme)."""
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    current_settings = {"theme": "light", "auto_refresh_seconds": 30}
+    if SETTINGS_FILE.exists():
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                current_settings = json.load(f)
+        except Exception:
+            pass
+
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        if "theme" in data:
+            current_settings["theme"] = "dark" if data["theme"] == "dark" else "light"
+        if "auto_refresh_seconds" in data:
+            try:
+                current_settings["auto_refresh_seconds"] = int(data["auto_refresh_seconds"])
+            except Exception:
+                pass
+        try:
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(current_settings, f, indent=2)
+        except Exception:
+            pass
+        return jsonify(current_settings)
+
+    return jsonify(current_settings)
+
+
+@app.route("/profile")
+def profile_route():
+    """Renders the Removix user profile page."""
+    from ui.profile_ui import render_profile_view
+    return render_profile_view()
+
+
+@app.route("/api/auth/config", methods=["GET"])
+def api_auth_config():
+    """Returns public Supabase configuration from .env."""
+    from modules.auth_config import get_supabase_config
+    return jsonify(get_supabase_config())
+
+
+# =====================================================================
+# 6. ENTRY POINT (Desktop Window or Localhost Web Server)
+# =====================================================================
 
 if __name__ == "__main__":
     import socket
@@ -4588,26 +2225,15 @@ if __name__ == "__main__":
     is_server_mode = os.environ.get("RENDER") is not None or "--server" in sys.argv or "--headless" in sys.argv
 
     if is_server_mode:
-        def _warmup_worker():
-            try:
-                from remove_ai_watermarks import region_eraser
-                region_eraser._get_lama_session()
-                print("Removix AI: LaMa neural network pre-warmed in memory.")
-            except Exception as e:
-                print(f"Removix warm-up note: {e}")
-
-        threading.Thread(target=_warmup_worker, daemon=True).start()
         print(f"Starting Removix Server on http://0.0.0.0:{port}...")
         app.run(host="0.0.0.0", port=port, debug=False)
     else:
-        # Native Desktop Application Mode (Silent native window, no browser tab, no console)
         def _run_flask():
             app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False)
 
         flask_thread = threading.Thread(target=_run_flask, daemon=True)
         flask_thread.start()
 
-        # Wait for local server to be responsive
         for _ in range(50):
             try:
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=0.2) as resp:
